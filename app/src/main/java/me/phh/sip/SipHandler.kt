@@ -701,7 +701,7 @@ class SipHandler(val ctxt: Context) {
 
     fun waitPrack(v: Int) {
         synchronized(prAckWaitLock) {
-            while (prAckWait.contains(v)) {
+            while (prAckWait.contains(v) && !callStopped.get()) {
                 prAckWaitLock.wait(1000)
             }
         }
@@ -802,6 +802,7 @@ a=sendrecv
             return 200
         }
         callStopped.set(true)
+        synchronized(prAckWaitLock) { prAckWaitLock.notifyAll() }
         Rlog.d(TAG, "Cancelled call ${request.headers["call-id"]!![0]}")
 
         // We're supposed to add an additional answer SIP/2.0 487 Request Terminated

@@ -219,6 +219,13 @@ data class SipResponse(
                 to.map {
                     if (it.contains(";tag=")) {
                         it
+                    } else if (statusCode == 100) {
+                        // RFC 3261 §8.2.6.2: a 100 Trying response MUST NOT contain a tag in
+                        // the To field when the request had none. Adding one here also caused a
+                        // dialog mismatch with the tag used in 183/180 that establish the early
+                        // dialog (Mavenir P-CSCF anchored on the 100 Trying tag, then dropped
+                        // PRACK referencing the 183 tag → 480 CC_NOT_REACHABLE).
+                        it
                     } else {
                         "$it;tag=${randomBytes(6).toHex()}"
                     }
