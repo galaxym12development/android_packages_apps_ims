@@ -5,9 +5,7 @@ import android.content.Context
 import android.os.Bundle
 import android.os.Message
 import android.telephony.Rlog
-import android.telephony.ServiceState
 import android.telephony.SubscriptionManager
-import android.telephony.TelephonyCallback
 import android.telephony.TelephonyManager
 import android.telephony.ims.ImsCallProfile
 import android.telephony.ims.ImsCallSessionListener
@@ -35,8 +33,6 @@ class PhhMmTelFeature(val slotId: Int) : PhhMmTelFeatureProtected(slotId) {
         private const val TAG = "PHH MmTelFeature"
     }
 
-    var telephonyManager: TelephonyManager? = null
-
     val imsSms = PhhImsSms(slotId)
     lateinit var sipHandler: SipHandler
     fun getSipHandlerOrNull(): SipHandler? = if (this::sipHandler.isInitialized) sipHandler else null
@@ -45,24 +41,24 @@ class PhhMmTelFeature(val slotId: Int) : PhhMmTelFeatureProtected(slotId) {
         super.initialize(context, slotId)
         featureState = STATE_INITIALIZING
 
-        telephonyManager =
-            mContext.getSystemService(TelephonyManager::class.java)
-                .createForSubscriptionId(SubscriptionManager.getSubscriptionId(slotId))
-
-        telephonyManager?.registerTelephonyCallback(
+        // We don't gate on ServiceState (framework rebuilds per-subscription callbacks
+        // on SIM PIN→READY, silently dropping our ServiceStateListener). Instead, watch
+        // subscription changes and gate on simOperator being readable: SipHandler reads
+        // simOperator/subscriberId in its constructor, so empty operator string would
+        // crash it. SipHandler.getVolteNetwork() handles the network-up wait itself.
+        val smgr = mContext.getSystemService(SubscriptionManager::class.java)
+        val baseTm = mContext.getSystemService(TelephonyManager::class.java)
+        smgr.addOnSubscriptionsChangedListener(
             Executors.newSingleThreadExecutor(),
-            object : TelephonyCallback(), TelephonyCallback.ServiceStateListener {
-                override fun onServiceStateChanged(serviceState: ServiceState) {
-                    // STATE_IN_SERVICE requires SIM unlocked and fully registered.
-                    // During PIN-lock phase state is STATE_EMERGENCY_ONLY — skip it.
-                    if (serviceState.state != ServiceState.STATE_IN_SERVICE) return
-                    serviceState.networkRegistrationInfoList.forEach {
-                        // A valid RPLMN is needed for SipHandler
-                        if (!(it.registeredPlmn?.isEmpty() ?: true)) {
-                            featureState = STATE_READY
-                            telephonyManager?.unregisterTelephonyCallback(this)
-                        }
-                    }
+            object : SubscriptionManager.OnSubscriptionsChangedListener() {
+                override fun onSubscriptionsChanged() {
+                    val subId = SubscriptionManager.getSubscriptionId(slotId)
+                    if (!SubscriptionManager.isValidSubscriptionId(subId)) return
+                    val tm = baseTm.createForSubscriptionId(subId)
+                    if (tm.simOperator.isNullOrEmpty()) return
+                    smgr.removeOnSubscriptionsChangedListener(this)
+                    Rlog.d(TAG, "$slotId STATE_READY (subId=$subId, op=${tm.simOperator})")
+                    featureState = STATE_READY
                 }
             })
     }

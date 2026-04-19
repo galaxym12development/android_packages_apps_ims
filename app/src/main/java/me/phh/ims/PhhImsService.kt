@@ -47,16 +47,10 @@ class PhhImsService : ImsService() {
         Rlog.d(TAG, "Alarm set")
     }
 
-    // XXX one per slot id...
-    var mmTelFeature: PhhMmTelFeature? = null
+    val mmTelFeatures = mutableMapOf<Int, PhhMmTelFeature>()
     override fun createMmTelFeature(slotId: Int): MmTelFeature {
-        Rlog.d(TAG, "createMmTelFeature")
-        var feature = mmTelFeature
-        if (feature == null) {
-            feature = PhhMmTelFeature(slotId)
-            mmTelFeature = feature
-        }
-        return feature
+        Rlog.d(TAG, "createMmTelFeature $slotId")
+        return mmTelFeatures.getOrPut(slotId) { PhhMmTelFeature(slotId) }
     }
     override fun createRcsFeature(slotId: Int): RcsFeature? {
         Rlog.d(TAG, "createRcsFeature")
@@ -77,11 +71,10 @@ class PhhImsService : ImsService() {
         }
     }
 
-    // XXX cache one per slot id
-    val imsRegistration = ImsRegistrationImplBase()
+    val imsRegistrations = mutableMapOf<Int, ImsRegistrationImplBase>()
     override fun getRegistration(slotId: Int): ImsRegistrationImplBase {
         Rlog.d(TAG, "getRegistration $slotId")
-        return imsRegistration
+        return imsRegistrations.getOrPut(slotId) { ImsRegistrationImplBase() }
     }
 
     override fun onDestroy() {
