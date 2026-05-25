@@ -988,10 +988,8 @@ a=sendrecv
                 Rlog.w(TAG, "AudioRecord: no TYPE_BUILTIN_MIC found, proceeding without preferredDevice")
             }
 
-            val prevAudioMode = audioManager.mode
-            audioManager.mode = android.media.AudioManager.MODE_IN_COMMUNICATION
             audioRecord.startRecording()
-            Rlog.d(TAG, "AudioRecord started, state=${audioRecord.recordingState} audioMode=${audioManager.mode} (was $prevAudioMode) preferredDevice=${audioRecord.preferredDevice?.type}")
+            Rlog.d(TAG, "AudioRecord started, state=${audioRecord.recordingState} audioMode=${audioManager.mode} preferredDevice=${audioRecord.preferredDevice?.type}")
 
             var firstPacket = true
             var realFrameCount = 0
@@ -1115,7 +1113,6 @@ a=sendrecv
             audioRecord.release()
             encoder.stop()
             encoder.release()
-            audioManager.mode = prevAudioMode
         }
     }
 
