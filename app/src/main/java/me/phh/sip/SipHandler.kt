@@ -1405,6 +1405,13 @@ a=sendrecv
                     hasEarlyMedia = resp.headers["p-early-media"]?.isNotEmpty() == true,
                     remoteContact = extractDestinationFromContact(resp.headers["contact"]!![0]),
                 )
+                // Voicemail and other auto-answer services send 200 OK directly
+                // without a preceding 183.  Start threads now that currentCall is set.
+                if (threadsStarted.compareAndSet(false, true)) {
+                    Rlog.d(TAG, "Starting decode/encode threads after currentCall set (direct 200 OK or early 183)")
+                    callDecodeThread()
+                    callEncodeThread()
+                }
 
                 // This isn't the answer to our INVITE, but to our later precondition UPDATE
                 // TODO Actually check cseq
