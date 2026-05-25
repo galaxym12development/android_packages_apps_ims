@@ -1,6 +1,6 @@
 # PhhIms — Issue Tracker
 
-## 1. Incoming call drops after answering [ACTIVE]
+## 1. Incoming call drops after answering [FIX COMMITTED - needs test]
 
 **Symptom:** Phone rings, user presses answer, call timer starts, call drops ~2 s later.
 Caller hears "not available".
@@ -11,17 +11,21 @@ computed later in the spawned thread). The Mavenir P-CSCF stored the first tag a
 when the caller's PRACK arrived referencing the 183 tag, the P-CSCF could not route it and timed out,
 sending CANCEL `Reason: SIP;cause=480;text="CC_NOT_REACHABLE"` after ~4 s.
 
-**Fix applied (needs test):**
-- `SipMessage.kt` — `completeResponseHeaders()`: skip adding To-tag for 100 Trying (RFC 3261 §12.1.1 permits omitting it)
-- `SipHandler.kt` — `waitPrack()`: also exit when `callStopped` is set (avoids thread leak on CANCEL)
+**Fix committed (`b0af852`):**
+- `SipMessage.kt` — `completeResponseHeaders()`: skip adding To-tag for 100 Trying. RFC 3261
+  §8.2.6.2 actually *forbids* it when the request had no To-tag — adding one was an outright
+  RFC violation, not just a Mavenir-specific quirk.
+- `SipHandler.kt` — `waitPrack()`: exit when `callStopped` is set (avoids thread leak on CANCEL).
 - `SipHandler.kt` — `handleCancel()`: `notifyAll()` on `prAckWaitLock` after setting `callStopped`
+  so `waitPrack` wakes immediately instead of polling for up to 1 s.
 
 **Logs:** `radio_imcomming_real.log` / `logcat_incomming_real.log` (2026-04-18 21:28)
-**Calls are rare (~2-3/week)** — verify carefully before deploying.
+**Calls are rare (~2-3/week)** — verify on next incoming call. Watch for: no PRACK timeout,
+no `cause=480 CC_NOT_REACHABLE` CANCEL, dialog established with the same To-tag in 183/180/200.
 
 ---
 
-## 2. IMS registration failure after late SIM unlock [FIXED - needs test]
+## 2. IMS registration failure after late SIM unlock [FIXED - verified]
 
 **Symptom:** After reboot, if SIM PIN is not entered immediately (~5 min delay),
 the IMS stack never registers. `*#*#4636#*#*` shows "Not Registered".
@@ -36,21 +40,29 @@ single callback field — the slot 0 call overwrites the slot 1 callback. For de
 ImsManager is notified; slot 1 never sees `STATE_READY` and `onFeatureReady()` is never called.
 Same singleton bug existed for `getRegistration()`.
 
-**Root cause (secondary): subId race in initialize()**
-At boot with a PIN-locked SIM, `getSubscriptionId(slotId)` may return -1 at `initialize()` time.
-`TelephonyManager.createForSubscriptionId(-1)` creates a manager bound to no real subscription,
-so its `ServiceStateListener` never fires when the SIM is later unlocked.
+**Root cause (secondary): per-subId TelephonyCallback dies on SIM PIN→READY**
+The original code registered a `TelephonyCallback.ServiceStateListener` on a `TelephonyManager`
+created via `createForSubscriptionId(subId)`. When the SIM transitions PIN-locked → READY, the
+framework rebuilds the per-subscription state for that `subId` and silently drops our callback.
+Diagnostic logs confirmed `onServiceStateChanged` fired twice with `STATE_OUT_OF_SERVICE`, then
+never again — even after the framework broadcast `mVoiceRegState=0(IN_SERVICE)` for the same subId.
 
-**Fix 1 applied (`PhhMmTelFeature.kt:initialize()`):**
-- Wrapped `registerTelephonyCallback()` in `OnSubscriptionsChangedListener` to defer until a
-  valid subId is available — handles both immediate and delayed PIN unlock.
+**Fix committed (`b3431da`):**
+- `PhhImsService.kt` — replaced singleton with per-slot maps (`mmTelFeatures` and
+  `imsRegistrations`) using `getOrPut(slotId)`. Each slot gets its own feature instance and
+  its own `mImsFeatureStatusCallback` slot.
+- `PhhImsBroadcastReceiver.kt` — alarm handler iterates the map so periodic re-REGISTER fires
+  for every active slot.
+- `PhhMmTelFeature.kt:initialize()` — dropped the `ServiceStateListener` entirely. Use
+  `OnSubscriptionsChangedListener` (lives on `SubscriptionManager`, not on a per-subId object,
+  so it survives the subscription rebuild) and gate `STATE_READY` on `simOperator` being
+  non-empty — that's the exact field `SipHandler` dereferences at construction. The network-up
+  wait happens later in `SipHandler.getVolteNetwork()`.
 
-**Fix 2 applied (`PhhImsService.kt`):**
-- `createMmTelFeature()`: replaced singleton with `val mmTelFeatures = mutableMapOf<Int,
-  PhhMmTelFeature>()` using `getOrPut(slotId)` — each slot gets its own feature instance.
-- `getRegistration()`: same per-slot map for `ImsRegistrationImplBase`.
-
-**Logs:** `radio_reg.log` / `logcat_reg.log` (2026-04-19 01:11–01:14, 01:31–01:33)
+**Diagnostic logs:** `radio_reg.log` / `logcat_reg.log` (2026-04-19 10:24) captured the
+secondary failure mode — `ServiceStateListener` fired twice with `STATE_OUT_OF_SERVICE` then
+silently stopped after `mVoiceRegState=0(IN_SERVICE)` was broadcast. Confirmed working on
+device after switching to the `OnSubscriptionsChangedListener` + `simOperator` gate.
 
 ---
 
@@ -64,20 +76,27 @@ and what `Expires` value the server grants.
 
 ---
 
-## 4. Binary patch breaks Voice Recorder app [LATER]
+## 4. Binary patch breaks Voice Recorder / video recording [FIXED]
 
-**Symptom:** After NOP patch at `libaudioproxy.so:0x9a46` (unconditional mic arming),
-the stock Voice Recorder app stops working. Video recording and VoIP calls still work.
+**Symptom (old Patch A):** After NOP patch at `libaudioproxy.so:0x9a46` (unconditional mic
+arming), the stock Voice Recorder app and video recording stopped working. VoIP calls worked.
 
-**Context:** The patch makes `proxy_open_capture_stream` always arm the ALSA mixer path,
-even for non-call capture streams. The Voice Recorder probably uses a path that relied on
-the guard to select a different mixer config.
+**Root cause of breakage:** Patch A removed the gate entirely, so ALL 48 kHz captures took
+the mixer-arming path even when the framework was in `MODE_NORMAL`. This corrupted mixer
+state for non-call captures.
 
-**Alternative fixes to try** (see `RE/README.md`):
-- Patch the `proxy_mode` value written by the audio HAL for SIP calls instead of NOP-ing the gate
-- Check if patching `audio.primary` to force proxy_mode ∈ [17..23] is safer for non-call capture
+**Fix committed (Patch F v2 — conditional hook):**
+Instead of NOP-ing the gate, the final patch is a **conditional hook** in
+`proxy_create_capture_stream` at `0xa30e`. It checks `ausage_param`:
+- `ausage_param == 1` (`MIC` / `VOICE_COMMUNICATION`) → `AUSAGE = 12` → `pcm12c` (real mic)
+- `ausage_param == 2` (`CAMCORDER`) → `AUSAGE = 110` → `pcm110c` (stock path)
+- `ausage_param == 27` (`VOICE_RECOGNITION`) → `AUSAGE = 110` → stock path
 
-**Priority:** Low — Voice Recorder is rarely used; VoLTE calls are the goal.
+**Verified on device 2026-05-25:**
+- SIP call with `VOICE_COMMUNICATION` → `pcm12c` open, audio works both ways
+- Video recording (`CAMCORDER`) → works (stays on stock `pcm110c` path)
+- Voice Recorder (`MIC`) → works (also gets `pcm12c`, which is correct for general mic use)
+
 
 ---
 
@@ -89,7 +108,9 @@ CP fallback calls may break because the baseband expects `MODE_IN_CALL` for hard
 **To test:**
 - Verify whether a privileged app can set `MODE_IN_COMMUNICATION` without the Telecomm patch
   (and whether the framework overwrites it back to `MODE_IN_CALL`)
-- Check if the binary NOP patch independently breaks CP fallback
+- Check if the conditional HAL patch (Patch F v2) independently affects CP fallback
+  (it should not — the hook only touches `stream_type=11` capture, not the voice-call
+  path which uses `stream_type=12` / `stream_type=24`)
 
 **Priority:** Low — CP fallback is not the primary use case.
 
@@ -97,7 +118,7 @@ CP fallback calls may break because the baseband expects `MODE_IN_CALL` for hard
 
 ## 6. Release & community [POST-FIX]
 
-Once incoming calls work reliably:
+Once incoming calls work reliably and the HAL patch is persistent:
 
 - [ ] Capture a demo video (incoming + outgoing call, audio both ways)
 - [ ] Build a flashable OTA or installable APK with all patches

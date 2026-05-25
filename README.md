@@ -129,14 +129,19 @@ allow sehradiomanager vendor_ims_prop:property_service set;
 
 ## Required binary patches
 
-The Samsung audio HAL (`libaudioproxy.so`) contains a range-gate in
-`proxy_open_capture_stream` that skips arming the ALSA mic mixer path unless an
-internal `proxy_mode` value is in `[17..23]`. For software IMS calls the value is
-always outside that range, so the microphone ADC stays silent.
+The Samsung audio HAL (`libaudioproxy.so`) routes `AudioRecord` with source
+`VOICE_COMMUNICATION` to the modem/baseband uplink PCM (`pcm110c`, `calliope_10`)
+instead of the real microphone (`pcm12c`, `WDMA0`). During a software IMS call
+there is no modem audio on this path, so the captured audio is silent.
 
-The fix is a 2-byte NOP patch at file offset `0x9a46` (vaddr `0xaa46`) that makes
-the mixer arming unconditional. Full reverse-engineering notes and the proxy_mode
-map are in [RE/README.md](RE/README.md).
+The root cause is in `proxy_create_capture_stream`: the inner TBH6 table for
+`stream_type=11` unconditionally sets `AUSAGE = 110` for **all** AudioSources that
+map to that stream type (`MIC`, `CAMCORDER`, `VOICE_RECOGNITION`, `VOICE_COMMUNICATION`).
+
+The fix is a **conditional hook** that checks `ausage_param` and routes only
+`VOICE_COMMUNICATION`/`MIC` to the real mic, while keeping `CAMCORDER` and
+`VOICE_RECOGNITION` on their original modem path. Full reverse-engineering notes
+are in [RE/README.md](RE/README.md).
 
 ### Step 1 — Pull the binary from the device
 
@@ -150,11 +155,11 @@ This places `libaudioproxy.so` in `RE/binaries/`.
 ### Step 2 — Verify and apply the patch
 
 ```sh
-# Dry-run: confirms the expected bytes are present
-python3 RE/scripts/patch_libaudioproxy.py
+# Verify current state
+python3 RE/scripts/patch_ausage_stream_type_11.py verify
 
-# Apply: writes RE/binaries/libaudioproxy_patched.so (original backed up as .so.orig)
-python3 RE/scripts/patch_libaudioproxy.py --apply
+# Apply: writes RE/binaries/libaudioproxy_patched.so (original backed up as .so.backup)
+python3 RE/scripts/patch_ausage_stream_type_11.py patch
 ```
 
 ### Step 3 — Push to device
@@ -165,9 +170,13 @@ Requires an unlocked bootloader and a userdebug build (so `adb root` and `adb re
 adb root
 adb remount
 adb push RE/binaries/libaudioproxy_patched.so /vendor/lib/libaudioproxy.so
-adb shell restorecon /vendor/lib/libaudioproxy.so
-adb reboot
+adb shell chmod 644 /vendor/lib/libaudioproxy.so
+adb shell stop audioserver && sleep 2 && adb shell start audioserver
 ```
+
+Note: `/vendor` is mounted as an overlay on erofs. Changes do not persist across
+reboots unless you re-push the patched binary after each boot, or make it
+persistent via a Magisk module or boot script.
 
 ## Required framework patches
 
@@ -206,15 +215,16 @@ real ADC path.
 
 ## Current status
 
-**Registation**: somtimes works
-
-**Incomming SMS**: work
-
-**Outgoing SMS**: not tested
-
-**Incomming Calls**: droped after user accepts the call
-
-**Outgoing Calls**: work *with incomming and outgoing audio and UI showing the call*, if you apply patches above
+| Feature | Status |
+|---------|--------|
+| Registration | Works (initial and periodic re-REGISTER both succeed) |
+| Incoming SMS | Works |
+| Outgoing SMS | Not tested |
+| Incoming Calls | Fix for "dropped after accept" committed; needs device verification |
+| Outgoing Calls | **Works** with the `libaudioproxy.so` conditional hook patch + Telecom `MODE_IN_COMMUNICATION` patch |
+| Mic audio during call | **Works** with conditional hook patch (routes `VOICE_COMMUNICATION` to real mic `pcm12c`) |
+| Video recording | **Works** with conditional hook patch (`CAMCORDER` stays on stock `pcm110c` path) |
+| Voice Recorder | **Works** with conditional hook patch |
 
 ## Building with Gradle
 

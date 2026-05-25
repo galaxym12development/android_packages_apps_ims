@@ -176,17 +176,19 @@ def decode(data, pos, vaddr):
         mask = hw1 & 0xF
         cc = ['eq','ne','cs','cc','mi','pl','vs','vc','hi','ls','ge','lt','gt','le','',''][it_cond]
         return 2, f"IT{'' if mask & 0x8 else 'E'} {cc}"
-    if (hw1 & 0xF800) == 0xB000:
+    # ADD SP, SP, #imm7  (must not match CBZ/CBNZ which also have top 5 bits = 10110)
+    if (hw1 & 0xFF80) == 0xB000:
         imm7 = hw1 & 0x7F
         sign = '+' if not (hw1 & 0x80) else '-'
         return 2, f"{'add' if not (hw1 & 0x80) else 'sub'} sp,sp,#0x{imm7 * 4:x}"
     if (hw1 & 0xFD00) == 0xB100:
         rn = hw1 & 0x7
-        imm = ((hw1 >> 3) & 0x1F) | ((hw1 >> 7 & 1) << 5)
+        # imm6 = (i << 5) | imm5, where i is bit 9 (not bit 7)
+        imm = ((hw1 >> 3) & 0x1F) | (((hw1 >> 9) & 1) << 5)
         return 2, f"cbz r{rn},0x{(vaddr + 4 + imm * 2) & 0xFFFF:05x}"
     if (hw1 & 0xFD00) == 0xB900:
         rn = hw1 & 0x7
-        imm = ((hw1 >> 3) & 0x1F) | ((hw1 >> 7 & 1) << 5)
+        imm = ((hw1 >> 3) & 0x1F) | (((hw1 >> 9) & 1) << 5)
         return 2, f"cbnz r{rn},0x{(vaddr + 4 + imm * 2) & 0xFFFF:05x}"
     if (hw1 & 0xF800) == 0x6800:
         rt, rn, imm5 = hw1 & 0x7, (hw1 >> 3) & 0x7, (hw1 >> 6) & 0x1F
