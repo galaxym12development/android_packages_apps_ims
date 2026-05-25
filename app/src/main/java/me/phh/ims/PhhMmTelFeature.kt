@@ -94,6 +94,24 @@ class PhhMmTelFeature(val slotId: Int) : PhhMmTelFeatureProtected(slotId) {
 
             override fun start(callee: String, profile: ImsCallProfile) {
                 Rlog.d(TAG, "Starting call with $callee profile $profile")
+
+                if (!sipHandler.isReadyForOutgoingCall()) {
+                    Rlog.w(TAG, "Rejecting outgoing call while IMS is reconnecting/not ready")
+                    mState = ImsCallSessionImplBase.State.TERMINATED
+                    if (this::mListener.isInitialized) {
+                        mListener.callSessionTerminated(
+                            ImsReasonInfo(
+                                ImsReasonInfo.CODE_NETWORK_REJECT,
+                                0,
+                                "IMS reconnecting"
+                            )
+                        )
+                    } else {
+                        Rlog.w(TAG, "No listener set while rejecting outgoing call during IMS reconnect")
+                    }
+                    return
+                }
+
                 sipHandler.call(callee)
             }
 

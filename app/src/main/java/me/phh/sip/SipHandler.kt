@@ -82,7 +82,8 @@ class SipHandler(val ctxt: Context) {
     //private val realm = "ims.mnc$mnc.mcc$mcc.3gppnetwork.org"
     private val realm = "ims.mnc$mnc.mcc$mcc.3gppnetwork.org"
     private val user = "$imsi@$realm"
-    private var akaDigest =
+    private var akaDigest = ""
+    private fun initialRegisterAuthorization(): String =
         """Digest username="$user",realm="$realm",nonce="",uri="sip:$realm",response="",algorithm=AKAv1-MD5"""
 
     fun generateCallId(): SipHeadersMap {
@@ -124,11 +125,27 @@ class SipHandler(val ctxt: Context) {
     private var requestCallbacks: Map<SipMethod, ((SipRequest) -> Int)> = mapOf()
     private var responseCallbacks: Map<String, ((SipResponse) -> Boolean)> = mapOf()
     private var imsReady = false
+    private var connectInProgress = false
+    fun isReadyForOutgoingCall(): Boolean = imsReady && !connectInProgress
+    private var pendingReconnect = false
+
+    private fun runPendingReconnectIfCallFinished() {
+        if (pendingReconnect && !callStarted.get()) {
+            pendingReconnect = false
+            Rlog.w(TAG, "Running deferred IMS reconnect now that call has finished")
+            try { connect() } catch (t: Throwable) {
+                Rlog.e(TAG, "Deferred reconnect failed", t)
+                imsFailureCallback?.invoke()
+            }
+        }
+    }
     var imsReadyCallback: (() -> Unit)? = null
     var imsFailureCallback: (() -> Unit)? = null
     var onSmsReceived: ((Int, String, ByteArray) -> Unit)? = null
     var onSmsStatusReportReceived: ((Int, String, ByteArray) -> Unit)? = null
     var onIncomingCall: ((handle: Object, from: String, extras: Map<String, String>) -> Unit)? =
+        null
+    var onOutgoingCallProgressing: ((handle: Object, extras: Map<String, String>) -> Unit)? =
         null
     var onOutgoingCallConnected: ((handle: Object, extras: Map<String, String>) -> Unit)? =
         null
@@ -225,6 +242,12 @@ class SipHandler(val ctxt: Context) {
 
     var abandonnedBecauseOfNoPcscf = false
     fun connect() {
+        if (connectInProgress) {
+            Rlog.d(TAG, "connect() already in progress, skipping")
+            return
+        }
+        connectInProgress = true
+        try {
         abandonnedBecauseOfNoPcscf = false
         Rlog.d(TAG, "Trying to connect to SIP server")
         val lp = connectivityManager.getLinkProperties(network)
@@ -257,6 +280,22 @@ class SipHandler(val ctxt: Context) {
         pcscfAddr = pcscf
 
         Rlog.w(TAG, "Connecting with address $localAddr to $pcscfAddr")
+
+        // Reset registration state for a fresh connect attempt. Stale nonce/realm from a
+        // previous challenge must not leak into the first REGISTER.
+        registerCounter = 1
+        akaDigest = initialRegisterAuthorization()
+        val registerCallId = generateCallId()
+        val registerFromTag = registerCallId["call-id"]!!.first().take(12)
+        registerHeaders =
+            """
+            From: <sip:$user>;tag=$registerFromTag
+            To: <sip:$user>
+            """.toSipHeadersMap() + registerCallId
+        commonHeaders = "".toSipHeadersMap()
+        contact = ""
+        mySip = ""
+        myTel = ""
 
         val clientSpiC = ipSecManager.allocateSecurityParameterIndex(localAddr)
         val clientSpiS = ipSecManager.allocateSecurityParameterIndex(localAddr, clientSpiC.spi + 1)
@@ -391,11 +430,27 @@ class SipHandler(val ctxt: Context) {
         socket.connect(portS)
         updateCommonHeaders(socket)
         register()
-        val regReply = (
+
+        Rlog.d(TAG, "Waiting for authenticated SIP REGISTER response")
+        val authenticatedRegisterReader =
             if (socket is SipConnectionTcp) socket.gReader()
             else if (socket is SipConnectionUdp) serverSocketUdp.gReader()
             else socket.gReader()
-        ).parseMessage()!!
+
+        val regReply = try {
+            authenticatedRegisterReader.parseMessage()
+        } catch (t: Throwable) {
+            Rlog.w(TAG, "Authenticated SIP REGISTER response read failed, aborting SIP", t)
+            imsFailureCallback?.invoke()
+            return
+        }
+
+        if (regReply == null) {
+            Rlog.w(TAG, "Authenticated SIP REGISTER got EOF/no response, aborting SIP")
+            imsFailureCallback?.invoke()
+            return
+        }
+
         Rlog.d(TAG, "Received $regReply")
 
         if (regReply !is SipResponse || regReply.statusCode != 200) {
@@ -426,9 +481,14 @@ class SipHandler(val ctxt: Context) {
                 Rlog.w(TAG, "Got exception in main/control socket, reconnecting", t)
             }
             socket.close()
-            try { connect() } catch (t: Throwable) {
-                Rlog.e(TAG, "Reconnect after main socket loss failed", t)
-                imsFailureCallback?.invoke()
+            if (currentCall != null) {
+                pendingReconnect = true
+                Rlog.w(TAG, "Deferring IMS reconnect because a call is active/pending")
+            } else {
+                try { connect() } catch (t: Throwable) {
+                    Rlog.e(TAG, "Reconnect after main socket loss failed", t)
+                    imsFailureCallback?.invoke()
+                }
             }
         }
         CoroutineScope(Dispatchers.IO).launch {
@@ -483,6 +543,9 @@ class SipHandler(val ctxt: Context) {
                     writer.reset()
                 }
             }
+        }
+        } finally {
+            connectInProgress = false
         }
     }
 
@@ -568,7 +631,7 @@ class SipHandler(val ctxt: Context) {
         val sipInstance = "<urn:gsma:imei:${imei.substring(0,8)}-${imei.substring(8,14)}-0>"
         val transport = if (socket is SipConnectionTcp) "tcp" else "udp"
         contact =
-            """<sip:$imsi@$local;transport=$transport>;expires=600000;+sip.instance="$sipInstance";+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+g.3gpp.smsip;audio"""
+            """<sip:$imsi@$local;transport=$transport>;expires=7200;+sip.instance="$sipInstance";+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+g.3gpp.smsip;audio"""
         val newHeaders =
             (if(socket is SipConnectionTcp) {
                 """
@@ -633,7 +696,7 @@ class SipHandler(val ctxt: Context) {
                 //"sip:lte-lguplus.co.kr",
                 registerHeaders +
                     """
-                    Expires: 600000
+                    Expires: 7200
                     Cseq: $registerCounter REGISTER
                     Contact: $contact
                     Supported: path, gruu, sec-agree
@@ -701,7 +764,7 @@ class SipHandler(val ctxt: Context) {
         val sipInstance = "<urn:gsma:imei:${imei.substring(0,8)}-${imei.substring(8,14)}-0>"
         val transport = if (socket is SipConnectionTcp) "tcp" else "udp"
         val contactTel =
-            """<sip:$myTel@$local;transport=$transport>;expires=600000;+sip.instance="$sipInstance";+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+g.3gpp.smsip;audio"""
+            """<sip:$myTel@$local;transport=$transport>;expires=7200;+sip.instance="$sipInstance";+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+g.3gpp.smsip;audio"""
         val msg =
             SipRequest(
                 SipMethod.SUBSCRIBE,
@@ -711,7 +774,7 @@ class SipHandler(val ctxt: Context) {
                     Contact: $contactTel
                     P-Preferred-Identity: <$mySip>
                     Event: reg
-                    Expires: 600000
+                    Expires: 7200
                     Supported: sec-agree
                     Require: sec-agree
                     Proxy-Require: sec-agree
@@ -845,6 +908,7 @@ a=sendrecv
 
         // We're supposed to add an additional answer SIP/2.0 487 Request Terminated
         onCancelledCall?.invoke(Object(), "", emptyMap())
+        runPendingReconnectIfCallFinished()
         return 200
     }
 
@@ -1059,6 +1123,53 @@ a=sendrecv
     }
 
     var currentCall: Call? = null
+
+    private fun completeIncomingPreconditionAnswerSdp(answerSdp: ByteArray, callId: String): ByteArray {
+        val lines = answerSdp
+            .toString(Charsets.UTF_8)
+            .split("[\r\n]+".toRegex())
+            .filter { it.isNotBlank() }
+
+        val hasPrecondition = lines.any { line ->
+            line.startsWith("a=curr:qos", ignoreCase = true) ||
+                line.startsWith("a=des:qos", ignoreCase = true) ||
+                line.startsWith("a=conf:qos", ignoreCase = true)
+        }
+        if (!hasPrecondition) return answerSdp
+
+        val rewritten = lines.map { line ->
+            when {
+                line.startsWith("a=curr:qos local", ignoreCase = true) -> "a=curr:qos local sendrecv"
+                line.startsWith("a=curr:qos remote", ignoreCase = true) -> "a=curr:qos remote sendrecv"
+                line.startsWith("a=des:qos optional local", ignoreCase = true) -> "a=des:qos mandatory local sendrecv"
+                line.startsWith("a=des:qos optional remote", ignoreCase = true) -> "a=des:qos mandatory remote sendrecv"
+                line.startsWith("a=des:qos mandatory local", ignoreCase = true) -> "a=des:qos mandatory local sendrecv"
+                line.startsWith("a=des:qos mandatory remote", ignoreCase = true) -> "a=des:qos mandatory remote sendrecv"
+                line.startsWith("a=conf:qos remote", ignoreCase = true) -> "a=conf:qos remote sendrecv"
+                line.equals("a=inactive", ignoreCase = true) -> "a=sendrecv"
+                line.equals("a=sendonly", ignoreCase = true) -> "a=sendrecv"
+                line.equals("a=recvonly", ignoreCase = true) -> "a=sendrecv"
+                else -> line
+            }
+        }.let { mapped ->
+            val withConf = if (mapped.any { it.startsWith("a=conf:qos remote", ignoreCase = true) }) {
+                mapped
+            } else {
+                mapped + "a=conf:qos remote sendrecv"
+            }
+            if (withConf.any { it.equals("a=sendrecv", ignoreCase = true) }) {
+                withConf
+            } else {
+                withConf + "a=sendrecv"
+            }
+        }
+
+        if (rewritten != lines) {
+            Rlog.d(TAG, "Completing incoming final 200 OK precondition SDP: callId=$callId")
+        }
+        return rewritten.joinToString("\r\n").toByteArray(Charsets.US_ASCII)
+    }
+
     fun acceptCall() {
         thread {
             // Wait for any outstanding PRACK acknowledgements before sending 200 OK (RFC 3262 §5)
@@ -1073,26 +1184,46 @@ a=sendrecv
             val sipInstance = "<urn:gsma:imei:${imei.substring(0, 8)}-${imei.substring(8, 14)}-0>"
             val transport = if (socket is SipConnectionTcp) "tcp" else "udp"
             val evolvedContact =
-                """<sip:$imsi@$local;transport=$transport>;expires=600000;+sip.instance="$sipInstance";+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+g.3gpp.smsip;+g.3gpp.mid-call;+g.3gpp.srvcc-alerting;+g.3gpp.ps2cs-srvcc-orig-pre-alerting"""
+                """<sip:$imsi@$local;transport=$transport>;expires=7200;+sip.instance="$sipInstance";+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+g.3gpp.smsip;+g.3gpp.mid-call;+g.3gpp.srvcc-alerting;+g.3gpp.ps2cs-srvcc-orig-pre-alerting"""
 
             Rlog.d(TAG, "Accepting call")
-            val call = currentCall!!
+            var call = currentCall!!
             val myHeaders = call.callHeaders
-            val myHeaders3 = myHeaders - "rseq" - "security-verify" + """
+
+            val omitFinalSdp = call.hasEarlyMedia
+            val finalBody = if (!omitFinalSdp) {
+                val finalSdp = completeIncomingPreconditionAnswerSdp(call.sdp, "")
+                if (!finalSdp.contentEquals(call.sdp)) {
+                    call = call.copy(sdp = finalSdp)
+                    currentCall = call
+                }
+                call.sdp
+            } else {
+                Rlog.d(TAG, "Omitting SDP from final incoming 200 OK because reliable provisional/UPDATE offer-answer already completed")
+                ByteArray(0)
+            }
+
+            val finalSdpHeaders = if (!omitFinalSdp) {
+                """
+                Content-Type: application/sdp
+                Content-Length: ${finalBody.size}
+                """.toSipHeadersMap()
+            } else {
+                "Content-Length: 0".toSipHeadersMap()
+            }
+
+            val myHeaders3 = myHeaders - "rseq" - "security-verify" - "content-type" - "content-length" + """
                 Session-Expires: 900;refresher=uas
                 P-Preferred-Identity: <$mySip>
                 Contact: $evolvedContact
-                Content-Type: application/sdp
-                """.toSipHeadersMap()
+                """.toSipHeadersMap() + finalSdpHeaders
 
-            // Normally we shouldn't send again the SDP. With "precondition" feature flag, the SDP in 183 Session Progress (then updated in UPDATE) should be used instead
-            // But for some yet unknown reason, I need to do it (even though it contradicts my pcaps)
             val msg3 =
                 SipResponse(
                     statusCode = 200,
                     statusString = "OK",
                     headersParam = myHeaders3,
-                    body = call.sdp
+                    body = finalBody
                 )
             Rlog.d(TAG, "Sending $msg3")
             synchronized(socket.gWriter()) { socket.gWriter().write(msg3.toByteArray()) }
@@ -1144,6 +1275,7 @@ a=sendrecv
 
             callStopped.set(true)
             onCancelledCall?.invoke(Object(), "", emptyMap())
+            runPendingReconnectIfCallFinished()
         }
     }
 
@@ -1161,6 +1293,7 @@ a=sendrecv
         Rlog.d(TAG, "Sending BYE $bye")
         synchronized(socket.gWriter()) { socket.gWriter().write(bye.toByteArray()) }
         onCancelledCall?.invoke(Object(), "", emptyMap())
+        runPendingReconnectIfCallFinished()
     }
 
     /*
@@ -1277,14 +1410,14 @@ a=sendrecv
                     "${socket.gLocalAddr().hostAddress}:${serverSocket.localPort}"
             val transport = if (socket is SipConnectionTcp) "tcp" else "udp"
             val contactTel =
-                """<sip:$myTel@$local;transport=$transport>;expires=600000;+sip.instance="$sipInstance";+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+g.3gpp.smsip;audio"""
+                """<sip:$myTel@$local;transport=$transport>;expires=7200;+sip.instance="$sipInstance";+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+g.3gpp.smsip;audio"""
             val myHeaders = commonHeaders +
                 """
                     From: <$mySip>
                     To: <$to>
                     P-Preferred-Identity: <$mySip>
                     P-Asserted-Identity: <$mySip>
-                    Expires: 600000
+                    Expires: 7200
                     Require: sec-agree
                     Proxy-Require: sec-agree
                     Allow: INVITE, ACK, CANCEL, BYE, UPDATE, REFER, NOTIFY, MESSAGE, PRACK, OPTIONS
@@ -1361,11 +1494,36 @@ a=sendrecv
                     onOutgoingCallConnected?.invoke(Object(), emptyMap())
                 } else {
                     Rlog.d(TAG, "Invite got status ${resp.statusCode} = ${resp.statusString}")
+                    if (resp.statusCode in 180..199) {
+                        val progressCseq = resp.headers["cseq"]?.getOrNull(0).orEmpty()
+                        val progressHasSdp = resp.headers["content-type"]?.getOrNull(0)
+                            ?.equals("application/sdp", ignoreCase = true) == true
+
+                        if (progressCseq.contains("INVITE", ignoreCase = true) && !progressHasSdp) {
+                            Rlog.d(
+                                TAG,
+                                "Outgoing call progressing without SDP: " +
+                                    "status=${resp.statusCode} ${resp.statusString} cseq=$progressCseq"
+                            )
+                            val callId = resp.headers["call-id"]?.getOrNull(0).orEmpty()
+                            onOutgoingCallProgressing?.invoke(
+                                Object(),
+                                mapOf(
+                                    "call-id" to callId,
+                                    "statusCode" to resp.statusCode.toString(),
+                                    "statusString" to resp.statusString,
+                                    "cseq" to progressCseq,
+                                    "local-ringback" to "true",
+                                ),
+                            )
+                        }
+                    }
                     if(resp.statusCode >= 400) {
                         onCancelledCall?.invoke(Object(), "",
                             mapOf(
                                 "statusCode" to resp.statusCode.toString(),
                                 "statusString" to resp.statusString))
+                        runPendingReconnectIfCallFinished()
                         // The whole call failed, so drop that call-id
                         return@setResponseCallback true
                     }
@@ -1641,8 +1799,22 @@ a=sendrecv
         }
 
         val hasEarlyMedia = request.headers["p-early-media"]?.isNotEmpty() == true
+        val callerSupports100Rel = (request.headers["supported"].orEmpty() +
+                request.headers["require"].orEmpty()).any { it.contains("100rel") }
         val callerSupportsPrecondition = (request.headers["supported"].orEmpty() +
                 request.headers["require"].orEmpty()).any { it.contains("precondition") }
+        val incomingOfferHasPrecondition = attributes.any { attr ->
+            attr.startsWith("curr:qos", ignoreCase = true) ||
+                attr.startsWith("des:qos", ignoreCase = true) ||
+                attr.startsWith("conf:qos", ignoreCase = true)
+        }
+        val incomingOfferIsInactive = attributes.any { it.equals("inactive", ignoreCase = true) }
+
+        // Some carriers send incoming VoLTE as inactive media with mandatory QoS
+        // preconditions and will not open downlink RTP until the provisional SDP is
+        // acknowledged with PRACK. Send 183 Session Progress for those calls.
+        val useReliableProvisional = hasEarlyMedia ||
+            (callerSupports100Rel && callerSupportsPrecondition && incomingOfferHasPrecondition && incomingOfferIsInactive)
 
         // Look for an AMR/8000 mode
         // TODO: Select which one? SFR has two, one with mode-set=7 one without it. This would require reading the fmtp lines
@@ -1671,7 +1843,7 @@ a=sendrecv
                     "${socket.gLocalAddr().hostAddress}:${serverSocket.localPort}"
             val sipInstance = "<urn:gsma:imei:${imei.substring(0,8)}-${imei.substring(8,14)}-0>"
             val contactTel =
-                """<sip:$myTel@$local;transport=tcp>;expires=600000;+sip.instance="$sipInstance";+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+g.3gpp.smsip;audio"""
+                """<sip:$myTel@$local;transport=tcp>;expires=7200;+sip.instance="$sipInstance";+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";+g.3gpp.smsip;audio"""
             val mySeqCounter = reliableSequenceCounter++
             val ipType = if(socket.gLocalAddr() is Inet6Address) "IP6" else "IP4"
             val mySdp = ("""
@@ -1732,7 +1904,7 @@ a=sendrecv
                 rtpRemotePort = rtpRemotePort.toInt(),
                 rtpSocket =  rtpSocket,
                 sdp = mySdp,
-                hasEarlyMedia = hasEarlyMedia,
+                hasEarlyMedia = useReliableProvisional,
                 remoteContact = extractDestinationFromContact(request.headers["contact"]!![0]),
             )
 
@@ -1744,7 +1916,7 @@ a=sendrecv
             synchronized(prAckWaitLock) {
                 prAckWait += mySeqCounter
             }
-            if (hasEarlyMedia) {
+            if (useReliableProvisional) {
                 val msg =
                     SipResponse(
                         statusCode = 183,
@@ -1756,7 +1928,7 @@ a=sendrecv
                 synchronized(socket.gWriter()) { socket.gWriter().write(msg.toByteArray()) }
                 waitPrack(mySeqCounter)
             }
-            if (!hasEarlyMedia) {
+            if (!useReliableProvisional) {
                 val myHeaders2 = myHeaders - "rseq" - "content-type" - "require" +
                     """
 Supported: 100rel, replaces, timer
@@ -1775,7 +1947,7 @@ P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=4500620f331a5e06
         }
 
         // Next step is 180 Ringing, handled in the thread
-        if (!hasEarlyMedia)
+        if (!useReliableProvisional)
             return 0
         return 100
     }
@@ -1889,7 +2061,7 @@ P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=4500620f331a5e06
                     To: <$dest>
                     P-Preferred-Identity: <$mySip>
                     P-Asserted-Identity: <$mySip>
-                    Expires: 600000
+                    Expires: 7200
                     Content-Type: application/vnd.3gpp.sms
                     Supported: sec-agree, path
                     Require: sec-agree
