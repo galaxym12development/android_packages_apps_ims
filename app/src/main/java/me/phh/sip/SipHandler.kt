@@ -296,6 +296,7 @@ class SipHandler(val ctxt: Context) {
         contact = ""
         mySip = ""
         myTel = ""
+        terminatedIncomingCallIds.clear()
 
         val clientSpiC = ipSecManager.allocateSecurityParameterIndex(localAddr)
         val clientSpiS = ipSecManager.allocateSecurityParameterIndex(localAddr, clientSpiC.spi + 1)
@@ -801,20 +802,13 @@ class SipHandler(val ctxt: Context) {
     }
 
     fun waitPrack(v: Int) {
-        synchronized(prAckWaitLock) {
-            while (prAckWait.contains(v) && !callStopped.get()) {
-                prAckWaitLock.wait(1000)
-            }
-        }
+        prackWaitTracker.waitFor(v)
     }
 
     fun handlePrack(request: SipRequest): Int {
         Rlog.d(TAG, "Received PRACK for ${request.headers["rack"]!![0]}")
-        synchronized(prAckWaitLock) {
-            val id = request.headers["rack"]!![0].split(" ")[0].toInt()
-            prAckWait -= id
-            prAckWaitLock.notifyAll()
-        }
+        val id = request.headers["rack"]!![0].split(" ")[0].toInt()
+        prackWaitTracker.ack(id)
         return 200
     }
 
@@ -903,8 +897,10 @@ a=sendrecv
             return 200
         }
         callStopped.set(true)
-        synchronized(prAckWaitLock) { prAckWaitLock.notifyAll() }
-        Rlog.d(TAG, "Cancelled call ${request.headers["call-id"]!![0]}")
+        prackWaitTracker.clearAndNotifyAll()
+        val callId = request.headers["call-id"]!![0]
+        Rlog.d(TAG, "Cancelled call $callId")
+        rememberTerminatedIncomingCall(callId, "remote CANCEL")
 
         // We're supposed to add an additional answer SIP/2.0 487 Request Terminated
         onCancelledCall?.invoke(Object(), "", emptyMap())
@@ -925,6 +921,7 @@ a=sendrecv
         val rtpSocket: DatagramSocket,
         val hasEarlyMedia: Boolean,
         val remoteContact: String,
+        val dialogNextCseq: AtomicInteger? = null,
     )
 
 
@@ -1173,8 +1170,8 @@ a=sendrecv
     fun acceptCall() {
         thread {
             // Wait for any outstanding PRACK acknowledgements before sending 200 OK (RFC 3262 §5)
-            val pendingSeqs = synchronized(prAckWaitLock) { prAckWait.toSet() }
-            pendingSeqs.forEach { waitPrack(it) }
+            // If the network never PRACKs our 183, don't block accept forever.
+            prackWaitTracker.dropStaleBeforeAccept(TAG)
 
             val local =
                 if(socket.gLocalAddr() is Inet6Address)
@@ -1232,7 +1229,7 @@ a=sendrecv
         }
     }
 
-    fun prack(resp: SipResponse) {
+    fun prack(resp: SipResponse, cseq: Int) {
         val who = extractDestinationFromContact(resp.headers["contact"]!![0])
         val callId = resp.headers["call-id"]!![0]
         val rseq = resp.headers["rseq"]!![0]
@@ -1248,6 +1245,7 @@ a=sendrecv
                 who,
                 headersParam = headers + """
                     RAck: $whatToPrack
+                    CSeq: $cseq PRACK
                     Require: sec-agree
                     To: ${resp.headers["to"]!![0]}
                     From: ${resp.headers["from"]!![0]}
@@ -1274,6 +1272,9 @@ a=sendrecv
             synchronized(socket.gWriter()) { socket.gWriter().write(msg.toByteArray()) }
 
             callStopped.set(true)
+            if (!call.outgoing) {
+                rememberTerminatedIncomingCall(call.callHeaders["call-id"]?.getOrNull(0).orEmpty(), "local reject")
+            }
             onCancelledCall?.invoke(Object(), "", emptyMap())
             runPendingReconnectIfCallFinished()
         }
@@ -1284,14 +1285,35 @@ a=sendrecv
         val call = currentCall ?: return
         // BYE is a dialog request; must use dialog route set (from 200 OK Record-Route)
         // stored in call.callHeaders, not the registration Service-Route in commonHeaders
+        val dialogCseq = call.dialogNextCseq?.getAndIncrement()
         val byeHeaders = call.callHeaders.filterKeys { it != "content-type" }
         val bye = SipRequest(
             SipMethod.BYE,
             call.remoteContact,
-            headersParam = byeHeaders
+            headersParam = if (dialogCseq != null) {
+                byeHeaders + "CSeq: $dialogCseq BYE".toSipHeadersMap()
+            } else {
+                byeHeaders
+            }
         )
         Rlog.d(TAG, "Sending BYE $bye")
         synchronized(socket.gWriter()) { socket.gWriter().write(bye.toByteArray()) }
+        if (!call.outgoing) {
+            rememberTerminatedIncomingCall(call.callHeaders["call-id"]?.getOrNull(0).orEmpty(), "local BYE")
+            currentCall = null
+        } else {
+            val outgoingByeCallId = call.callHeaders["call-id"]?.getOrNull(0).orEmpty()
+            Rlog.d(TAG, "Keeping outgoing dialog until BYE transaction completes callId=$outgoingByeCallId")
+            myHandler.postDelayed({
+                if (currentCall?.outgoing == true &&
+                    currentCall?.callHeaders?.get("call-id")?.getOrNull(0) == outgoingByeCallId &&
+                    callStopped.get()
+                ) {
+                    Rlog.w(TAG, "Clearing outgoing dialog after BYE response timeout callId=$outgoingByeCallId")
+                    currentCall = null
+                }
+            }, 4000L)
+        }
         onCancelledCall?.invoke(Object(), "", emptyMap())
         runPendingReconnectIfCallFinished()
     }
@@ -1440,6 +1462,11 @@ a=sendrecv
                     myHeaders,
                     sdp
                 )
+            val outgoingInviteCseq = msg.headers["cseq"]?.getOrNull(0)
+                ?.substringBefore(" ")
+                ?.toIntOrNull()
+                ?: 1
+            val outgoingDialogNextCseq = AtomicInteger(outgoingInviteCseq + 1)
             setResponseCallback(msg.headers["call-id"]!![0]) { r: SipResponse ->
                 var resp = r
                 var cseq = resp.headers["cseq"]!![0]
@@ -1453,7 +1480,19 @@ a=sendrecv
                     rseqHandled = true
                 }
 
-                if (cseq.contains("ACK")) return@setResponseCallback  false
+                if (cseq.contains("ACK")) return@setResponseCallback false
+                if (cseq.contains("BYE")) {
+                    val byeCallId = resp.headers["call-id"]?.getOrNull(0).orEmpty()
+                    if (resp.statusCode in 200..299) {
+                        Rlog.d(TAG, "Outgoing BYE accepted; clearing dialog callId=$byeCallId cseq=$cseq")
+                    } else if (resp.statusCode >= 300) {
+                        Rlog.w(TAG, "Outgoing BYE failed; clearing local dialog anyway: status=${resp.statusCode} ${resp.statusString} cseq=$cseq callId=$byeCallId")
+                    } else {
+                        return@setResponseCallback false
+                    }
+                    currentCall = null
+                    return@setResponseCallback true
+                }
 
                 if (cseq.contains("INVITE") && (resp.statusCode == 200 || resp.statusCode == 202)) {
                     // ACK C-Seq must be the same as INVITE C-Seq
@@ -1530,7 +1569,8 @@ a=sendrecv
                 }
 
                 if(resp.headers["rseq"]?.isNotEmpty() == true && !rseqHandled) {
-                    prack(resp)
+                    val prackCseq = outgoingDialogNextCseq.getAndIncrement()
+                    prack(resp, prackCseq)
                     respInFlight = resp
                     return@setResponseCallback false
                 }
@@ -1562,6 +1602,7 @@ a=sendrecv
                     sdp = resp.body,
                     hasEarlyMedia = resp.headers["p-early-media"]?.isNotEmpty() == true,
                     remoteContact = extractDestinationFromContact(resp.headers["contact"]!![0]),
+                    dialogNextCseq = outgoingDialogNextCseq,
                 )
                 // Voicemail and other auto-answer services send 200 OK directly
                 // without a preceding 183.  Start threads now that currentCall is set.
@@ -1720,15 +1761,36 @@ a=sendrecv
     val threadsStarted = AtomicBoolean(false)
     val callGeneration = AtomicInteger(0)
 
-    val prAckWaitLock = Object()
-    var prAckWait = mutableSetOf<Int>()
+    private val prackWaitTracker = PrackWaitTracker()
+    private val terminatedIncomingCallIds = RecentCallIdCache(
+        tag = TAG,
+        label = "terminated incoming",
+        ttlMs = 30_000L,
+    )
+
+    private fun rememberTerminatedIncomingCall(callId: String, reason: String) {
+        terminatedIncomingCallIds.remember(callId, "duplicate INVITE guard: $reason")
+    }
+
+    private fun wasRecentlyTerminatedIncomingCall(callId: String): Boolean {
+        return terminatedIncomingCallIds.contains(callId)
+    }
+
     fun handleCall(request: SipRequest): Int {
+        val incomingCallId = request.headers["call-id"]!![0]
+        if (wasRecentlyTerminatedIncomingCall(incomingCallId)) {
+            val incomingCseq = request.headers["cseq"]?.getOrNull(0).orEmpty()
+            Rlog.w(TAG, "Rejecting duplicate incoming INVITE for recently terminated Call-ID: callId=$incomingCallId cseq=$incomingCseq")
+            return 486
+        }
+
         val contentType = request.headers["content-type"]?.get(0)
         if (contentType != "application/sdp") return 404
         callStopped.set(false)
         callStarted.set(false)
         threadsStarted.set(false)
         callGeneration.incrementAndGet()
+        prackWaitTracker.clearAndNotifyAll()
 
         val f = request.headers["from"]
         val r = Regex(".*(sip|tel):([^@]*).*")
@@ -1913,9 +1975,7 @@ a=sendrecv
                 callEncodeThread()
             }
 
-            synchronized(prAckWaitLock) {
-                prAckWait += mySeqCounter
-            }
+            prackWaitTracker.add(mySeqCounter)
             if (useReliableProvisional) {
                 val msg =
                     SipResponse(
