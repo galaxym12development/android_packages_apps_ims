@@ -138,6 +138,16 @@ class SipHandler(val ctxt: Context) {
     private var smsToken = 0
     private val smsHeadersMap = mutableMapOf<Int, smsHeaders>()
 
+    // Reconnect the control socket if no REGISTER response arrives within this window.
+    // Mavenir P-CSCF can silently drop the control socket mid-exchange; without this,
+    // periodic re-REGISTER would hang forever (response never parsed) and the framework
+    // would keep thinking we're registered while the binding has actually expired.
+    private val registerTimeoutMs = 30_000L
+    private val registerTimeoutRunnable = Runnable {
+        Rlog.w(TAG, "REGISTER response timeout, closing socket to force reconnect")
+        try { socket.close() } catch (_: Throwable) {}
+    }
+
     fun setRequestCallback(method: SipMethod, cb: (SipRequest) -> Int) {
         cbLock.withLock { requestCallbacks += (method to cb) }
     }
@@ -161,9 +171,14 @@ class SipHandler(val ctxt: Context) {
         if (msg is SipResponse) {
             return handleResponse(msg)
         }
+        if (msg == null) {
+            // peer closed connection (clean EOF)
+            Rlog.d(TAG, "Got EOF, closing socket")
+            return false
+        }
         if (msg !is SipRequest) {
-            // invalid message, stop trying
-            Rlog.d(TAG, "Got invalid message! Closing socket (except main)")
+            // unexpected message type
+            Rlog.d(TAG, "Got invalid message $msg, closing socket")
             return false
         }
 
@@ -417,27 +432,38 @@ class SipHandler(val ctxt: Context) {
             }
         }
         CoroutineScope(Dispatchers.IO).launch {
-            try {
-                while (true) {
-                    // XXX catch and reconnect on 'java.net.SocketException: Socket closed' ?
-                    val client = serverSocket.serverSocket.accept()
-                    // there can only be a single client at a time because
-                    // both source and destination ports are fixed
+            while (true) {
+                val client = try {
+                    serverSocket.serverSocket.accept()
+                } catch (t: SocketTimeoutException) {
+                    // Transient: accept() unblocked without a peer. Keep listening.
+                    Rlog.d(TAG, "TCP server accept() timed out, continuing", t)
+                    continue
+                } catch (t: Throwable) {
+                    if (serverSocket.serverSocket.isClosed) {
+                        Rlog.e(TAG, "TCP server socket closed, listener stopping", t)
+                        break
+                    }
+                    Rlog.d(TAG, "TCP server accept() error, continuing", t)
+                    continue
+                }
+                try {
                     val reader = client.getInputStream().sipReader()
                     val writer = client.getOutputStream()
                     while (parseMessage(reader, writer)) { }
-                    client.close()
+                } catch (t: Throwable) {
+                    Rlog.d(TAG, "TCP server client error, continuing accept loop", t)
+                } finally {
+                    try { client.close() } catch (_: Throwable) {}
                 }
-            } catch(t: Throwable) {
-                Rlog.d(TAG, "Got exception in TCP server socket", t)
             }
         }
         CoroutineScope(Dispatchers.IO).launch {
-            try {
-                val bufferIn = ByteArray(128 * 1024)
-                val dgramPacketIn = DatagramPacket(bufferIn, bufferIn.size)
-                val writer = ByteArrayOutputStream()
-                while (true) {
+            val bufferIn = ByteArray(128 * 1024)
+            val dgramPacketIn = DatagramPacket(bufferIn, bufferIn.size)
+            val writer = ByteArrayOutputStream()
+            while (true) {
+                try {
                     dgramPacketIn.length = bufferIn.size
                     serverSocketUdp.socket.receive(dgramPacketIn)
                     Rlog.d(TAG, "Received dgram packet")
@@ -448,9 +474,14 @@ class SipHandler(val ctxt: Context) {
                     val dgramPacketOut = DatagramPacket(writerOut, writerOut.size, dgramPacketIn.address, dgramPacketIn.port)
                     serverSocketUdp.socket.send(dgramPacketOut)
                     writer.reset()
+                } catch (t: Throwable) {
+                    if (serverSocketUdp.socket.isClosed) {
+                        Rlog.e(TAG, "UDP server socket closed, listener stopping", t)
+                        break
+                    }
+                    Rlog.d(TAG, "UDP server packet error, continuing receive loop", t)
+                    writer.reset()
                 }
-            } catch(t: Throwable) {
-                Rlog.d(TAG, "Got exception in UDP server socket", t)
             }
         }
     }
@@ -582,7 +613,6 @@ class SipHandler(val ctxt: Context) {
         // connections ? Just keep it constant for now
         // XXX samsung doesn't increment cnonce but it would be better to avoid replays?
         // well that'd only matter if the server refused replays, so keep as is.
-        // XXX timeout/retry? notification on fail? receive on thread?
 
         val writer = _writer ?: socket.gWriter()
 
@@ -617,9 +647,17 @@ class SipHandler(val ctxt: Context) {
         Rlog.d(TAG, "Sending $msg")
         synchronized(writer) { writer.write(msg.toByteArray()) }
         registerCounter += 1
+        // Only arm the watchdog for post-connect re-REGISTERs: the initial register
+        // during connect() reads its 401 synchronously on plainSocket, so this
+        // watchdog (which closes `socket`) would not help there anyway.
+        if (_writer == null) {
+            myHandler.removeCallbacks(registerTimeoutRunnable)
+            myHandler.postDelayed(registerTimeoutRunnable, registerTimeoutMs)
+        }
     }
 
     fun registerCallback(response: SipResponse): Boolean {
+        myHandler.removeCallbacks(registerTimeoutRunnable)
         // once we get there all register must be successful
         // on failure just abort thread, ims will restart
         require(response.statusCode == 200)
@@ -1672,7 +1710,7 @@ a=sendrecv
                         RSeq: $mySeqCounter
                         P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=20810b8c49752501
                         """.toSipHeadersMap() +
-                            request.headers.filter { (k, _) -> k in listOf("cseq", "via", "from", "to", "call-id") } +
+                            request.headers.filter { (k, _) -> k in listOf("cseq", "via", "from", "to", "call-id", "record-route") } +
                             mapOf("to" to toWithTag) -
                 "route" - "security-verify"
 
