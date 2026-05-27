@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 patch_ausage_stream_type_11.py — Patch proxy_create_capture_stream to route
-VOICE_COMMUNICATION capture from modem uplink (calliope_10, pcm110c) to real mic
-(WDMA0, pcm12c), WITHOUT affecting CAMCORDER or VOICE_RECOGNITION.
+VOICE_COMMUNICATION capture from modem uplink (calliope_10, pcm110c) to a real
+microphone WDMA path, WITHOUT affecting CAMCORDER or VOICE_RECOGNITION.
 
 Root cause:
   Samsung HAL maps ALL AudioSources with stream_type=11 (MIC, CAMCORDER,
@@ -15,12 +15,17 @@ Targeted fix:
   vaddr 0xbae4 (unused NOP padding + unused literal-pool area).
 
   The hook checks ausage_param ([r8, #4]):
-    - ausage_param == 1  (MIC / VOICE_COMMUNICATION) → AUSAGE = 12  (pcm12c, real mic)
+    - ausage_param == 1  (MIC / VOICE_COMMUNICATION) → AUSAGE = 16  (pcm16c, WDMA4)
     - ausage_param == 2  (CAMCORDER)                 → AUSAGE = 110 (pcm110c, stock)
     - ausage_param == 27 (VOICE_RECOGNITION)         → AUSAGE = 110 (pcm110c, stock)
 
   This way SIP calls get real mic audio, while video recording and other
   stream_type=11 captures keep their original behaviour.
+
+NOTE: mixer_paths.xml analysis confirms Samsung's standard mic paths
+(`media-mic`, `communication-handset-mic`) route to WDMA4 (pcm16c).
+AUSAGE=16 (WDMA4) is the correct value. AUSAGE=12 (WDMA0) was an earlier
+incorrect assumption that leads to `invalid source dai` kernel errors.
 
 File offsets:
   Branch:   fileoff 0x930e  (vaddr 0xa30e)
@@ -63,14 +68,17 @@ PATCH_BRANCH = bytes([0x01, 0xF0, 0xE9, 0xBB])
 #   ldr.w r0, [r8, #4]
 #   cmp r0, #1
 #   ite eq
-#   moveq r6, #12
+#   moveq r6, #16           ; AUSAGE=16 -> pcm16c (WDMA4)
 #   movne r6, #110
 #   b.w a37a
+#
+# NOTE (2026-05-27): mixer_paths.xml confirms Samsung's mic paths route to WDMA4
+# (pcm16c), not WDMA0. AUSAGE=16 is the correct value.
 PATCH_HOOK = bytes([
     0xD8, 0xF8, 0x04, 0x00,  # ldr.w r0, [r8, #4]
     0x01, 0x28,              # cmp r0, #1
     0x0C, 0xBF,              # ite eq
-    0x0C, 0x26,              # moveq r6, #12
+    0x10, 0x26,              # moveq r6, #16
     0x6E, 0x26,              # movne r6, #110
     0xFE, 0xF7, 0x43, 0xBC,  # b.w a37a
 ])

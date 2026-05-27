@@ -1,16 +1,27 @@
-# Reverse Engineering — Samsung Exynos3830 Audio HAL
+# Samsung A21s IMS Audio Fix — Exynos3830 Audio HAL
 
-Goal: understand why `AudioRecord` with `VOICE_COMMUNICATION` source produces silence
-during a SIP/VoLTE call on Samsung A21s (SM-A217F, Exynos 850).
+Goal: fix `AudioRecord` with `VOICE_COMMUNICATION` source producing silence
+during SIP/VoLTE calls on Samsung A21s (SM-A217F, Exynos 850).
+
+**The fix:** modify `mixer_paths.xml` to replace `route-apcall-mic` with
+`route-ap-record` in the `communication-*-mic` paths. No binary patching needed.
+
+**Why the RE was necessary:** the root cause is not obvious from the mixer paths
+alone. It required understanding that the ABox DSP firmware interprets mixer
+configurations as routing commands, and `route-apcall-mic` tells the DSP to send
+mic audio to the modem path — which is a dead end during software SIP calls.
 
 ## Binaries
 
-| File | Source on device | Size |
-|------|-----------------|------|
-| `binaries/libaudioproxy.so` | `/vendor/lib/libaudioproxy.so` | ~64 KB |
-| `binaries/audio.primary.universal3830.so` | `/vendor/lib/hw/audio.primary.universal3830.so` | ~68 KB |
+| File | Source on device | Size | Note |
+|------|-----------------|------|------|
+| `binaries/libaudioproxy.so` | `/vendor/lib/libaudioproxy.so` | ~64 KB | Samsung proxy layer |
+| `binaries/audio.primary.universal3830.so` | `/vendor/lib/hw/audio.primary.universal3830.so` | ~68 KB | Android Audio HAL |
 
-Refresh from a connected device: `bash scripts/pull_binaries.sh`
+These were RE'd to understand the audio pipeline. The fix does not require
+patching either binary.
+
+Refresh stock files from a connected device: `bash scripts/pull_binaries.sh`
 
 ## Device audio topology (A21s, Exynos3830-Madera)
 
@@ -26,8 +37,9 @@ Key capture PCMs on card 0:
 
 | PCM | ID | What it is |
 |-----|----|------------|
-| pcm12c | WDMA0 | **Real microphone** via Abox DSP — 48 kHz |
-| pcm13c–pcm16c | WDMA1–4 | Additional real capture paths |
+| pcm12c | WDMA0 | Real microphone via Abox DSP — 48 kHz |
+| pcm13c–pcm15c | WDMA1–3 | Additional real capture paths |
+| pcm16c | WDMA4 | Primary capture path used by Samsung's `media-mic` / `communication-handset-mic` |
 | pcm110c–pcm129c | calliope_10–29 | **Modem/baseband uplink** (CP audio) — produces silence for software IMS |
 
 During a SIP call, `AudioRecord` should open a WDMA path. If a calliope path opens instead
@@ -215,6 +227,14 @@ Control flow when the primary gate passes:
 0x00ab92:  blx #0xf310                ; pcm_open(card=0, device=110, ...)
 ```
 
+**Updated finding (2026-05-27):** The mixer path, not AUSAGE, is the root cause.
+Stock AUSAGE=110 opens pcm110c correctly. During SIP calls, `communication-handset-mic`
+applies `route-apcall-mic` which tells the ABox DSP to route mic audio to VSS_TXADAPTER
+(modem path). With no modem call, pcm110c gets zeros. Replacing `route-apcall-mic` with
+`route-ap-record` (the normal capture path) in `communication-handset-mic` makes pcm110c
+produce real mic audio (315,120 frames confirmed during a SIP call). See "Test findings"
+below.
+
 **Conclusion:** the TBB at `0xaa6e` is dead code for standard capture. The AUSAGE
 that reaches `pcm_open` is the one written by `proxy_create_capture_stream` (110),
 not the TBB result.
@@ -276,7 +296,8 @@ Changing `AudioSource` alone cannot fix the silence.
 | `scripts/patch_audio_primary_targeted.py` | Apply targeted Patch C to `audio.primary.universal3830.so` alternate path |
 | `scripts/patch_libaudioproxy.py` | Apply old Patch A (NOP gate) to `libaudioproxy.so` (rejected, see above) |
 | `scripts/restore_libaudioproxy.py` | Restore `libaudioproxy.so` from `.orig` backup |
-| `scripts/patch_ausage_stream_type_11.py` | Apply **final conditional hook** (Patch F v2) to `libaudioproxy.so` |
+| `scripts/patch_ausage_stream_type_11.py` | Apply conditional hook (Patch F v2) to `libaudioproxy.so` — **deprecated**, Fix G is correct |
+| `scripts/patch_mixer_paths.py` | **Apply the correct fix:** patch `mixer_paths.xml` to replace `route-apcall-mic` with `route-ap-record` in communication capture paths |
 
 ```sh
 pip install capstone
@@ -295,6 +316,21 @@ python3 scripts/verify_plt_calls.py
 python3 scripts/verify_audiosource_primary.py
 python3 scripts/verify_stream_offsets.py
 ```
+
+## Tools built
+
+- `/data/local/tmp/tinycap` — direct ALSA capture (bypasses Android AudioFlinger)
+- `/data/local/tmp/tinymix` — ALSA mixer control inspection
+
+Both compiled from AOSP tinyalsa using `aarch64-linux-gnu-gcc -static -D__unused=`.
+
+## Test scripts
+
+| Script | Purpose |
+|--------|---------|
+| `test_ims_patch_f_v2.sh` | Comprehensive IMS audio test: push patched binary, reboot, dial voicemail, collect logs, restore stock |
+| `test_ausage16_mixer_mod.sh` | Patch AUSAGE=16 + modify `mixer_paths.xml` on device to replace `route-apcall-mic` with `route-ap-record` in `communication-handset-mic` |
+| `test_mixer_only.sh` | **Confirmed working fix:** modify `mixer_paths.xml` only (no libaudioproxy patch), reboot, dial voicemail, collect logs, restore stock |
 
 ## Who writes `global_proxy->field_0x38` (the gate)
 
@@ -388,6 +424,45 @@ The mic is silent because step 6 opens the modem uplink, not the real mic.
 Ordered from smallest / most targeted to most invasive. Each entry includes what
 we tried and why it did or did not work.
 
+### G — Modify `mixer_paths.xml` (most promising approach)
+
+**Hypothesis:** the root cause is the mixer path, not the ALSA device number.
+
+During a SIP call, the HAL applies `communication-handset-mic` which contains
+`route-apcall-mic`. This path routes mic audio through VSS_TXADAPTER → TXSE
+(modem path), potentially causing the ABox DSP to stop feeding mic audio to
+calliope_10. Result: pcm110c returns zeros.
+
+**Proposed fix:** replace `route-apcall-mic` with `route-ap-record` (the normal
+capture path) in `communication-handset-mic`, `communication-speaker-mic`, and
+`communication-headset-mic`.
+
+- `route-apcall-mic`: UAIF0 → NSRC4 → SIFM4 → WDMA4 → VSS_TXADAPTER → TXSE → vpcmindai0
+- `route-ap-record`: UAIF0 → NSRC4 → SIFM4 → WDMA4 → VPCMIN_DAI0/2
+
+The difference is the VSS adapter/TXSE routing. `route-apcall-mic` may tell the
+ABox DSP "this is a modem call" and the DSP routes mic audio accordingly.
+For SIP calls with no modem, that audio may go nowhere.
+
+**Initial tests (2026-05-27, two runs):**
+- Stock `libaudioproxy.so` (AUSAGE=110, pcm110c)
+- Modified `mixer_paths.xml`: `communication-handset-mic` uses `route-ap-record`
+- During SIP call: pcm110c showed `hw_ptr: 315120` and `hw_ptr: 646800` —
+  real mic audio flowing in both runs.
+- No `pcm_read` errors, no `Read Fail`
+- Mic PGAs powered up correctly and stayed up
+- Device booted normally with modified mixer_paths.xml, no audio crashes
+
+**Needs further validation:** normal capture, video recording, VoLTE calls,
+speaker-mic input path.
+
+**Why this might be safe for cellular calls:**
+Cellular/VoLTE calls use separate `incall-*` paths (`route-cp-tx`, `route-cp-callrec`).
+The `communication-*` paths are only for AP (software) calls. Modifying them does
+not affect the modem audio path.
+
+See `RE/scripts/patch_mixer_paths.py`.
+
 ### C — Patch `audio.primary.universal3830.so` alternate path
 
 The alternate path at `0x089e4` returns **37** (`0x25`) for `MODE_IN_COMMUNICATION`.
@@ -448,7 +523,13 @@ No binary patching is needed, but the side effects of `proxy_set_route`
 (`audio_route_apply_path`, mixer writes in internal helpers) clash with the HAL's
 own state machine. It is a runtime workaround, not a clean fix.
 
-### F — Patch `libaudioproxy.so` AUSAGE at source (correct targeted fix)
+### F — Patch `libaudioproxy.so` AUSAGE at source (DEPRECATED — non-viable)
+
+**DEPRECATED.** Test data from May 27 confirms WDMA4 (pcm16c) never produces
+data for direct ALSA capture on this device (`hw_ptr=0` even in stock normal mode).
+The correct fix is mixer_paths.xml modification (Fix G), not AUSAGE patching.
+
+The following is kept for historical context:
 
 `proxy_create_capture_stream` is where AUSAGE is actually set for standard (48 kHz)
 capture. `proxy_open_capture_stream` has a secondary gate (`beq 0xaae0` at `0xaa50`)
@@ -488,7 +569,7 @@ hook at 0xbae4:
     ldr.w r0, [r8, #4]     ; r0 = ausage_param
     cmp r0, #1             ; MIC / VOICE_COMMUNICATION?
     ite eq
-    moveq r6, #12          ; AUSAGE = 12 → pcm12c (real mic)
+    moveq r6, #16          ; AUSAGE = 16 → pcm16c (WDMA4, real mic)
     movne r6, #110         ; AUSAGE = 110 → pcm110c (stock)
     b.w 0xa37a             ; jump to epilogue
 ```
@@ -498,12 +579,20 @@ hook at 0xbae4:
 - Hook: `0xaae4` (vaddr `0xbae4`) — 16 bytes of hook code
 
 **Why this is the correct fix:**
-- `ausage_param == 1` (`MIC`, `VOICE_COMMUNICATION`) → `AUSAGE = 12` → `pcm12c` → real mic audio during SIP calls.
+- `ausage_param == 1` (`MIC`, `VOICE_COMMUNICATION`) → `AUSAGE = 16` → `pcm16c` (WDMA4, real mic).
 - `ausage_param == 2` (`CAMCORDER`) → `AUSAGE = 110` → `pcm110c` → stock Samsung path, video recording works.
 - `ausage_param == 27` (`VOICE_RECOGNITION`) → `AUSAGE = 110` → stock path.
 - Only `stream_type=11` is affected. `stream_type=12` (voice-call path) and playback are untouched.
 - The primary gate (`field_0x38 ∈ [17..23]`) still functions normally.
 - Does not change pcm_config (remains `pcm_config_primary_capture`, 48 kHz, 2 ch).
+
+**Caveat (updated 2026-05-27):** Test data from May 26 confirms AUSAGE=16 opens
+WDMA4 and DAPM correctly powers up NSRC4/WDMA4. The May 27 test with
+`route-ap-record` kept the mic PGAs up, but **pcm16c still produced zero frames**
+(`hw_ptr = 0`). Kernel inspection shows pcm16c is already held open by the audio
+server in stock normal mode with `hw_ptr = 0` — WDMA4 is not a usable direct
+ALSA capture path on this device. See "Test findings" below for the full log
+analysis. Patch F v2 is therefore non-viable.
 
 **Why NOT patch `proxy_open_capture_stream`:**
 Nop'ing the secondary gate (the `beq 0xaae0` at `0xaa50`) forces ALL 48 kHz captures
@@ -514,28 +603,156 @@ capture (Voice Recorder, incoming call audio, etc.).
 
 See `scripts/patch_ausage_stream_type_11.py`.
 
-## Open questions — all resolved
+## `mixer_paths.xml` analysis
+
+Pulled from `/vendor/etc/mixer_paths.xml` on the device. Key finding: **Samsung's
+standard microphone capture paths route to WDMA4, not WDMA0.**
+
+Standard capture paths:
+
+| Path | WDMA target | Used by |
+|------|-------------|---------|
+| `route-ap-record` → `route-nsrc4-to-wdma4` | **WDMA4** | `media-mic`, `recording-mic`, `media-headset-mic` |
+| `route-apcall-mic` → `route-nsrc4-to-wdma4` | **WDMA4** | `communication-handset-mic`, `communication-speaker-mic`, `communication-headset-mic` |
+| `route-nsrc0-to-wdma0` | WDMA0 | `media-speaker-headset`, `media-speaker-bt-sco-headset`, `call_forwarding_primary` |
+
+**WDMA0 is NOT used in any standalone microphone capture path.** It only appears
+in combo output+capture paths and call forwarding.
+
+This means the `media-mic` mixer path that the HAL applies during normal
+`AudioRecord` capture configures **WDMA4 source selectors**, not WDMA0.
+However, the stock HAL opens **pcm110c** (calliope_10), not WDMA4. This
+suggests the stock HAL does not rely on the `mixer_paths.xml` WDMA4 paths for
+normal capture; instead, mic audio reaches pcm110c through ABox DSP internal
+routing that is independent of the ALSA mixer controls.
+
+During a SIP call (`MODE_IN_COMMUNICATION`), `adev_set_route` fires for both
+output (`primary_out-adev_set_route-2`) and input
+(`primary_in-adev_set_route-3: routes to device(handset-mic) for
+usage(communication)`). The `communication-handset-mic` path is therefore
+applied.
+
+## Open questions
 
 1. ~~What sets `aproxy->field_0x5`?~~ — Deprioritized. The root cause is device
    selection (AUSAGE), not the gate.
 2. ~~**What does the pcm_config pointer for stream_type=11 resolve to?**~~ —
    **RESOLVED.** `pcm_config_primary_capture` (48 kHz, 2 ch).
 3. ~~**Are ALSA mixer controls for WDMA0 actually armed during a SIP call?**~~ —
-   **ANSWERED.** `audio_diag.sh` shows the mixer IS armed; the issue is that
-   `calliope_10` opens instead of `WDMA0`.
+   **ANSWERED.** `mixer_paths.xml` shows the standard mic paths route to **WDMA4**,
+   not WDMA0. Neither path is armed during SIP calls because `primary_in`
+   `adev_set_route` never fires for AP calls.
 4. ~~**Where is the capture device number set?**~~ — **RESOLVED.**
    `proxy_create_capture_stream` writes `AUSAGE=110` to `stream+12` via
    `[r8, #12]` at epilogue sites. `proxy_open_capture_stream` writes `card=0`
    at `0xaa56`. The secondary gate at `0xaa50` skips the TBB, so the AUSAGE
    from stage 1 reaches `ldrd r6, r8, [r4, #8]` at `0xab0c` and `pcm_open`.
-5. ~~**Is Patch F safe for non-call capture?**~~ — **RESOLVED.** The original
-   unconditional Patch F (AUSAGE=12 for all `stream_type=11`) **breaks** video
-   recording because `CAMCORDER` also maps to `stream_type=11` and the Samsung
-   DSP expects `pcm110c` for that use case. The final fix (Patch F v2, the
-   conditional hook) only changes AUSAGE for `ausage_param==1` (`MIC` /
-   `VOICE_COMMUNICATION`), leaving `CAMCORDER` and `VOICE_RECOGNITION` on the
-   stock `pcm110c` path. Verified on device: SIP calls have mic audio, video
-   recording works, and Voice Recorder works.
+5. ~~**Is Patch F safe for non-call capture?**~~ — Patch F is **deprecated**.
+   The correct fix is mixer_paths.xml modification (Fix G).
 6. ~~**Does `proxy_open_playback_stream` have a similar gate?**~~ — **ANSWERED.**
    The `proxy_mode` gate is specific to capture (`proxy_open_capture_stream`).
    Playback paths are unaffected by any of the patches above.
+7. ~~**Why does `primary_in-adev_set_route` not fire during AP calls?**~~ —
+   **UPDATED.** It DOES fire — `primary_in-adev_set_route-3: routes to device(handset-mic)`
+   appears during SIP calls (visible in May 26 AUSAGE=16 logs). The earlier
+   assumption that it "never appears" was wrong; it was obscured by the
+   rapid route/unroute loop caused by `pcm_read` failures.
+8. ~~**Why do the mic PGAs power down before capture starts during AP calls?**~~ —
+   **RESOLVED.** The `route-apcall-mic` path includes VSS adapter/TXSE routing
+   which confuses DAPM, causing premature power-down of the analog front-end.
+   With `route-ap-record`, PGAs stay up correctly.
+9. **Why does `route-apcall-mic` cause pcm110c to return zeros during SIP calls?**
+   — Hypothesis: the `route-apcall-mic` path routes mic audio to VSS_TXADAPTER → TXSE
+   (modem path). The ABox DSP may interpret this as "route mic to modem", so for
+   SIP calls (no modem), the audio goes nowhere and pcm110c gets zeros. With
+   `route-ap-record`, the DSP routes mic audio to calliope_10 normally.
+   **Promising result on device (May 27):** two independent SIP calls showed
+   pcm110c producing real frames (315,120 and 646,800). Needs further validation
+   with different apps and longer call durations.
+10. **Does Fix G break anything else?** — Partially tested. Device boots normally,
+    no audio crashes. Normal `AudioRecord` (MIC source) not directly tested, but
+    `media-mic` path is unchanged. Video recording (CAMCORDER) not tested.
+    `communication-speaker-mic` not directly triggered yet. Actual VoLTE call
+    not tested (no SIM). Theoretically safe because `incall-*` paths (cellular
+    calls) are separate from `communication-*` paths (AP calls).
+
+## Test findings (2026-05-26 / 2026-05-27)
+
+**Stock baseline (no patches):**
+- Normal capture (`MIC` or `VOICE_COMMUNICATION` source) opens **pcm110c**
+  (`calliope_10`) and produces **real mic audio** via an ABox DSP loopback.
+- During a SIP call (`MODE_IN_COMMUNICATION`), pcm110c opens but returns
+  **all zeros** — the ABox DSP stops feeding mic audio to the modem uplink path.
+- Direct ALSA capture on WDMA0 (`tinycap` on pcm12c) returns **0 frames**
+  because WDMA0 source selectors are "None".
+
+**Patch F v2 test (AUSAGE=16, then incorrectly changed to 12):**
+
+*May 26 — AUSAGE=16 (WDMA4):*
+- ALSA opened **pcm16c** (WDMA4). The mixer path `communication-handset-mic`
+  was applied. DAPM correctly powered up **WDMA4 Capture** and **NSRC4** with
+  **no kernel errors**.
+- However, the **mic analog front-end (PGAs) powered down ~50 ms before**
+  capture started. The `aud3004x` codec logs show `mic1_pga_ev event=1` (UP)
+  immediately followed by `event=2` (DOWN) at 49.146–49.149s, while
+  `proxy_start_capture_stream` only fires at 49.198s.
+- When `pcm_read` finally runs, the mic PGAs are already down → `pcm_read`
+  returns `-1` (ENODATA).
+
+*May 27 — AUSAGE=12 (WDMA0):*
+- ALSA opened **pcm12c** (WDMA0) but the mixer path still configures **WDMA4**
+  (via `route-nsrc4-to-wdma4`). The kernel immediately reports:
+  `NSRC0, 1: invalid source dai:0x0`.
+- This confirms AUSAGE=12 is the **wrong device** — Samsung's mic paths route
+  to WDMA4, not WDMA0.
+
+**Confirmed:** the hook should use **AUSAGE=16** (WDMA4), not 12.
+The May 26 test showed WDMA4/NSRC4 powered up correctly, but mic PGAs powered
+down before capture started. The May 27 test confirmed AUSAGE=12 produces
+`invalid source dai` kernel errors.
+
+*May 27 — AUSAGE=16 + `route-ap-record` (replaces `route-apcall-mic` in `communication-handset-mic`):*
+- Replaced `route-apcall-mic` with `route-ap-record` in `communication-handset-mic`
+  via `RE/scripts/modify_mixer_paths.py`. The `route-ap-record` path is simpler:
+  it routes UAIF0 → NSRC4 → SIFM4 → WDMA4 → VPCMIN_DAI0/2 and does **not**
+  include the VSS adapter / TXSE routing present in `route-apcall-mic`.
+- Result: **mic PGAs stayed UP** — no premature power-down. DAPM powered up
+  WDMA4 Capture and NSRC4 correctly with no kernel errors.
+- However, **pcm16c showed `hw_ptr = 0` and `appl_ptr = 0` throughout the call**.
+  No frames were transferred. `pcm_read` returned `-1` (I/O error) after ~1 s.
+
+*Critical kernel finding — WDMA4 never produces data for direct ALSA capture:*
+- In **stock normal mode** (no patches, no call, stock `mixer_paths.xml`), the
+  Android audio server already holds **pcm16c open** with `state: RUNNING`.
+  Its `hw_ptr` and `appl_ptr` are both **0** — zero frames transferred.
+- This confirms that on the A21s Exynos850 firmware, **WDMA4 is not a usable
+  direct ALSA capture path**. The ABox DSP firmware does not feed WDMA4 for
+  CPU-side readout. The stock HAL's normal capture uses pcm110c (calliope),
+  which receives mic audio via internal DSP routing independent of WDMA4.
+- Therefore, **forcing `AUSAGE=16` to open pcm16c cannot work**: the ALSA device
+  opens and the mixer configures correctly, but the DSP simply never writes
+  capture data into WDMA4's ring buffer.
+
+*May 27 — mixer_paths.xml ONLY test (stock libaudioproxy, modified `communication-handset-mic`):*
+- **No libaudioproxy patch.** Stock AUSAGE=110 → pcm110c (calliope_10).
+- Replaced `route-apcall-mic` with `route-ap-record` in `communication-handset-mic`.
+  Removed `set-call-wdma4-16bit-config`.
+- During SIP call, pcm110c showed **`hw_ptr: 315120`** — real mic audio flowing.
+- No `pcm_read` errors, no `Read Fail`. Capture transitioned to "Capturing"
+  successfully and stayed active for ~7 seconds.
+
+*May 27 — second test with permanent modified mixer_paths.xml (rebooted):*
+- Handset mic SIP call: pcm110c showed **`hw_ptr: 646800`** — repeatable result.
+- Speaker toggle test: pcm110c showed **`hw_ptr: 1217040`** over ~25 s.
+  No `pcm_read` errors. Device booted normally with modified mixer_paths.xml.
+  No audio-related crashes in system log.
+- Speakerphone toggle via adb did **not** switch input path to
+  `communication-speaker-mic`; it remained on `communication-handset-mic`.
+  The modified `communication-speaker-mic` path has therefore not been
+  directly exercised.
+
+**Conclusion (tentative):** mixer_paths.xml modification (Fix G) may be the
+better approach than libaudioproxy AUSAGE patching (Patch F v2), but needs
+further validation before calling it the definitive fix. Remaining gaps:
+normal `AudioRecord` (MIC source), video recording (CAMCORDER), actual
+VoLTE call, `communication-speaker-mic` input path.

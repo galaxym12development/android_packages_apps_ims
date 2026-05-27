@@ -37,6 +37,38 @@ index 76b9f18..5e014e2 100644
  PRODUCT_COPY_FILES += \
      $(COMMON_PATH)/configs/ril/sehradiomanager.conf:$(TARGET_COPY_OUT_VENDOR)/etc/sehradiomanager.conf
  
+diff --git a/configs/mixer/mixer_paths.xml b/configs/mixer/mixer_paths.xml
+index 426b64d..c4d817a 100644
+--- a/configs/mixer/mixer_paths.xml
++++ b/configs/mixer/mixer_paths.xml
+@@ -1407,15 +1407,13 @@
+ 
+ 	<path name="communication-handset-mic">
+ 		<path name="dev-dual-mic" />
+-		<path name="set-call-wdma4-16bit-config" />
+-		<path name="route-apcall-mic" />
++		<path name="route-ap-record" />
+ 		<ctl name="ABOX Sound Type" value="VOICE" />
+ 	</path>
+ 
+ 	<path name="communication-speaker-mic">
+ 		<path name="dev-dual-invert-mic" />
+-		<path name="set-call-wdma4-16bit-config" />
+-		<path name="route-apcall-mic" />
++		<path name="route-ap-record" />
+ 		<ctl name="ABOX Sound Type" value="SPEAKER" />
+ 	</path>
+ 
+@@ -1429,8 +1427,7 @@
+ 
+ 	<path name="communication-headset-mic">
+ 		<path name="dev-headset-mic" />
+-		<path name="set-call-wdma4-16bit-config" />
+-		<path name="route-apcall-mic" />
++		<path name="route-ap-record" />
+ 		<ctl name="ABOX Sound Type" value="HEADSET" />
+ 	</path>
+ 
 diff --git a/lineage.dependencies b/lineage.dependencies
 index 6eb89eb..903778a 100644
 --- a/lineage.dependencies

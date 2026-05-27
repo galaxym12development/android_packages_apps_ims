@@ -1,5 +1,10 @@
 # phhusson/ims — VoLTE for LineageOS on Samsung devices
 
+**Note:** For production use, prefer the [krazey-ims](https://github.com/krazey/ims) fork.
+It has a better structure, more fixes, and is hardware-agnostic. This repo is kept
+primarily as a guide for device tree integration and audio issue debugging on devices
+with similar Samsung binaries.
+
 Open-source SIP/IMS stack for LineageOS, based on [phhusson/ims](https://github.com/phhusson/ims).
 Tested on Samsung Galaxy A21s (SM-A217F) running LineageOS 23.2 (Android 16) with O2 Germany.
 
@@ -47,8 +52,8 @@ framework APIs (`Rlog`, `MmTelFeature`, `ImsConfigImplBase`, etc.) without patch
 The following shows the full diff needed in your device tree. Adapt paths and package
 names for your device.
 
-If you have the same device, you can apply [the patch](./device_a21s_common.patch)
-to [`device_a21s_common`](https://github.com/LineageOS/android_device_samsung_a21s-common) repository
+If you have the same device, apply [the patch](./device_a21s_common.patch)
+to [`device_a21s_common`](https://github.com/LineageOS/android_device_samsung_a21s-common) repository.
 
 ### `common.mk` (or `device.mk`)
 
@@ -127,91 +132,69 @@ vendor.ril.ims.                u:object_r:vendor_ims_prop:s0
 allow sehradiomanager vendor_ims_prop:property_service set;
 ```
 
+### `configs/mixer/mixer_paths.xml` — the audio fix
+
+During a SIP/VoLTE call the Samsung
+audio HAL applies the `communication-handset-mic` path, which contains
+`route-apcall-mic`. This path tells the ABox DSP to route mic audio to the
+modem/VSS path. During a software IMS call there is no modem audio on this
+path, so the captured audio is silent.
+
+The fix is to replace `route-apcall-mic` with `route-ap-record` (the normal
+capture path) in all `communication-*-mic` paths. This tells the DSP to keep
+routing mic audio to `calliope_10` (pcm110c), which is where the HAL opens
+the capture stream.
+
+```diff
+--- a/configs/mixer/mixer_paths.xml
++++ b/configs/mixer/mixer_paths.xml
+@@ -1407,15 +1407,13 @@
+ 
+ 	<path name="communication-handset-mic">
+ 		<path name="dev-dual-mic" />
+-		<path name="set-call-wdma4-16bit-config" />
+-		<path name="route-apcall-mic" />
++		<path name="route-ap-record" />
+ 		<ctl name="ABOX Sound Type" value="VOICE" />
+ 	</path>
+ 
+ 	<path name="communication-speaker-mic">
+ 		<path name="dev-dual-invert-mic" />
+-		<path name="set-call-wdma4-16bit-config" />
+-		<path name="route-apcall-mic" />
++		<path name="route-ap-record" />
+ 		<ctl name="ABOX Sound Type" value="SPEAKER" />
+ 	</path>
+ 
+@@ -1429,8 +1427,7 @@
+ 
+ 	<path name="communication-headset-mic">
+ 		<path name="dev-headset-mic" />
+-		<path name="set-call-wdma4-16bit-config" />
+-		<path name="route-apcall-mic" />
++		<path name="route-ap-record" />
+ 		<ctl name="ABOX Sound Type" value="HEADSET" />
+ 	</path>
+```
+
+Cellular calls use separate `incall-*` paths and are unaffected.
+
+No binary patching or framework patches are needed.
+
 ## Required binary patches
 
-The Samsung audio HAL (`libaudioproxy.so`) routes `AudioRecord` with source
-`VOICE_COMMUNICATION` to the modem/baseband uplink PCM (`pcm110c`, `calliope_10`)
-instead of the real microphone (`pcm12c`, `WDMA0`). During a software IMS call
-there is no modem audio on this path, so the captured audio is silent.
+**None.** Earlier versions required patching `libaudioproxy.so` to change the
+ALSA device selection, but the real fix is in the mixer path configuration above.
 
-The root cause is in `proxy_create_capture_stream`: the inner TBH6 table for
-`stream_type=11` unconditionally sets `AUSAGE = 110` for **all** AudioSources that
-map to that stream type (`MIC`, `CAMCORDER`, `VOICE_RECOGNITION`, `VOICE_COMMUNICATION`).
-
-The fix is a **conditional hook** that checks `ausage_param` and routes only
-`VOICE_COMMUNICATION`/`MIC` to the real mic, while keeping `CAMCORDER` and
-`VOICE_RECOGNITION` on their original modem path. Full reverse-engineering notes
-are in [RE/README.md](RE/README.md).
-
-### Step 1 — Pull the binary from the device
-
-```sh
-cd RE/
-bash scripts/pull_binaries.sh   # requires: adb root
-```
-
-This places `libaudioproxy.so` in `RE/binaries/`.
-
-### Step 2 — Verify and apply the patch
-
-```sh
-# Verify current state
-python3 RE/scripts/patch_ausage_stream_type_11.py verify
-
-# Apply: writes RE/binaries/libaudioproxy_patched.so (original backed up as .so.backup)
-python3 RE/scripts/patch_ausage_stream_type_11.py patch
-```
-
-### Step 3 — Push to device
-
-Requires an unlocked bootloader and a userdebug build (so `adb root` and `adb remount` work):
-
-```sh
-adb root
-adb remount
-adb push RE/binaries/libaudioproxy_patched.so /vendor/lib/libaudioproxy.so
-adb shell chmod 644 /vendor/lib/libaudioproxy.so
-adb shell stop audioserver && sleep 2 && adb shell start audioserver
-```
-
-Note: `/vendor` is mounted as an overlay on erofs. Changes do not persist across
-reboots unless you re-push the patched binary after each boot, or make it
-persistent via a Magisk module or boot script.
+Reverse-engineering notes for the Samsung audio HAL are kept in
+[RE/README.md](RE/README.md) for reference.
 
 ## Required framework patches
 
-### `packages/services/Telecomm` — use `MODE_IN_COMMUNICATION` instead of `MODE_IN_CALL`
-
-The Samsung audio HAL treats `MODE_IN_CALL` specially: it reconfigures any active primary
-capture stream to the baseband uplink PCM path (`/dev/snd/pcmC0D110c`), which taps the
-hardware circuit-switched voice path and produces silence for software IMS stacks that do
-their own RTP encoding.  Switching to `MODE_IN_COMMUNICATION` keeps the microphone on the
-real ADC path.
-
-```diff
---- a/src/com/android/server/telecom/CallAudioModeStateMachine.java
-+++ b/src/com/android/server/telecom/CallAudioModeStateMachine.java
-@@ -523,10 +523,17 @@ public class CallAudioModeStateMachine extends StateMachine {
-             Log.i(this, "enter: AudioManager#requestAudioFocus(CALL)");
-             mAudioManager.requestAudioFocusForCall(AudioManager.STREAM_VOICE_CALL,
-                 AudioManager.AUDIOFOCUS_GAIN_TRANSIENT);
--            Log.i(this, "enter: AudioManager#setMode(MODE_IN_CALL)");
--            mAudioManager.setMode(AudioManager.MODE_IN_CALL);
--            mLocalLog.log("Mode MODE_IN_CALL");
--            mMostRecentMode = AudioManager.MODE_IN_CALL;
-+            // Use MODE_IN_COMMUNICATION instead of MODE_IN_CALL so that the Samsung audio HAL
-+            // does not route AudioRecord capture to the baseband uplink PCM path.  When in
-+            // MODE_IN_CALL the HAL reconfigures any primary capture stream to callrecord_uplink
-+            // (/dev/snd/pcmC0D110c), which taps the hardware CP voice path and produces silence
-+            // for software IMS stacks that do their own RTP encoding.  MODE_IN_COMMUNICATION
-+            // keeps the capture on the real microphone ADC path.
-+            Log.i(this, "enter: AudioManager#setMode(MODE_IN_COMMUNICATION)");
-+            mAudioManager.setMode(AudioManager.MODE_IN_COMMUNICATION);
-+            mLocalLog.log("Mode MODE_IN_COMMUNICATION");
-+            mMostRecentMode = AudioManager.MODE_IN_COMMUNICATION;
-             mCallAudioManager.setCallAudioRouteFocusState(CallAudioRouteController.ACTIVE_FOCUS);
-         }
-```
+**None.** Earlier versions required a patch in `packages/services/Telecomm`
+to use `MODE_IN_COMMUNICATION` instead of `MODE_IN_CALL`. With the current
+fork the framework correctly receives the IMS call state and sets the mode
+appropriately. The mixer path fix alone is sufficient.
 
 ## Current status
 
@@ -221,10 +204,10 @@ real ADC path.
 | Incoming SMS | Works |
 | Outgoing SMS | Not tested |
 | Incoming Calls | Fix for "dropped after accept" committed; needs device verification |
-| Outgoing Calls | **Works** with the `libaudioproxy.so` conditional hook patch + Telecom `MODE_IN_COMMUNICATION` patch |
-| Mic audio during call | **Works** with conditional hook patch (routes `VOICE_COMMUNICATION` to real mic `pcm12c`) |
-| Video recording | **Works** with conditional hook patch (`CAMCORDER` stays on stock `pcm110c` path) |
-| Voice Recorder | **Works** with conditional hook patch |
+| Outgoing Calls | Works with mixer_paths.xml fix |
+| Mic audio during call | Works with mixer_paths.xml fix |
+| Video recording | Works (stock path, unaffected) |
+| Voice Recorder | Works (stock path, unaffected) |
 
 ## Building with Gradle
 
