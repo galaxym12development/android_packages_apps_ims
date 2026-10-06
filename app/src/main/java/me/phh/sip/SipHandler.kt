@@ -530,10 +530,15 @@ class SipHandler(val ctxt: Context) {
                     Rlog.d(TAG, "Received dgram packet")
                     val baIs = ByteArrayInputStream(dgramPacketIn.data, dgramPacketIn.offset, dgramPacketIn.length)
                     val reader = baIs.sipReader()
-                    while (parseMessage(reader, writer)) { }
+                    // Replies sent back over the UDP server flow never reach the P-CSCF;
+                    // answer over the TCP control connection like the INVITE responses
+                    val replyWriter = if (socket is SipConnectionTcp) socket.gWriter() else writer
+                    while (parseMessage(reader, replyWriter)) { }
                     val writerOut = writer.toByteArray()
-                    val dgramPacketOut = DatagramPacket(writerOut, writerOut.size, dgramPacketIn.address, dgramPacketIn.port)
-                    serverSocketUdp.socket.send(dgramPacketOut)
+                    if (writerOut.isNotEmpty()) {
+                        val dgramPacketOut = DatagramPacket(writerOut, writerOut.size, dgramPacketIn.address, dgramPacketIn.port)
+                        serverSocketUdp.socket.send(dgramPacketOut)
+                    }
                     writer.reset()
                 } catch (t: Throwable) {
                     if (serverSocketUdp.socket.isClosed) {
@@ -890,7 +895,17 @@ a=sendrecv
         return 0
     }
 
+    fun currentCallId(): String? = currentCall?.callHeaders?.get("call-id")?.getOrNull(0)
+
     fun handleCancel(request: SipRequest): Int {
+        val cancelId = request.headers["call-id"]?.getOrNull(0).orEmpty()
+        val current = currentCall?.callHeaders?.get("call-id")?.getOrNull(0)
+        if (current != null && current != cancelId) {
+            Rlog.d(TAG, "CANCEL for non-current dialog $cancelId")
+            rememberTerminatedIncomingCall(cancelId, "remote CANCEL")
+            onCancelledCall?.invoke(Object(), "", mapOf("call-id" to cancelId, "stale" to "1"))
+            return 200
+        }
         // RFC 3261 §9.2: CANCEL has no effect if we already sent a final response (200 OK)
         if (callStarted.get()) {
             Rlog.d(TAG, "CANCEL received after 200 OK — ignoring per RFC 3261 §9.2")
@@ -903,7 +918,7 @@ a=sendrecv
         rememberTerminatedIncomingCall(callId, "remote CANCEL")
 
         // We're supposed to add an additional answer SIP/2.0 487 Request Terminated
-        onCancelledCall?.invoke(Object(), "", emptyMap())
+        onCancelledCall?.invoke(Object(), "", mapOf("call-id" to callId))
         runPendingReconnectIfCallFinished()
         return 200
     }
@@ -912,7 +927,8 @@ a=sendrecv
         val callId = request.headers["call-id"]?.getOrNull(0).orEmpty()
         val call = currentCall
         if (call == null || call.callHeaders["call-id"]?.getOrNull(0) != callId) {
-            Rlog.d(TAG, "BYE for unknown dialog $callId")
+            Rlog.d(TAG, "BYE for non-current dialog $callId")
+            onCancelledCall?.invoke(Object(), "", mapOf("call-id" to callId, "stale" to "1"))
             return 200
         }
         Rlog.d(TAG, "Remote BYE for $callId")
@@ -920,7 +936,7 @@ a=sendrecv
         prackWaitTracker.clearAndNotifyAll()
         if (!call.outgoing) rememberTerminatedIncomingCall(callId, "remote BYE")
         currentCall = null
-        onCancelledCall?.invoke(Object(), "", emptyMap())
+        onCancelledCall?.invoke(Object(), "", mapOf("call-id" to callId))
         runPendingReconnectIfCallFinished()
         return 200
     }
@@ -1300,18 +1316,40 @@ a=sendrecv
         // BYE is a dialog request; must use dialog route set (from 200 OK Record-Route)
         // stored in call.callHeaders, not the registration Service-Route in commonHeaders
         val dialogCseq = call.dialogNextCseq?.getAndIncrement()
-        val byeHeaders = call.callHeaders.filterKeys { it != "content-type" }
-        val bye = SipRequest(
-            SipMethod.BYE,
-            call.remoteContact,
-            headersParam = if (dialogCseq != null) {
-                byeHeaders + "CSeq: $dialogCseq BYE".toSipHeadersMap()
-            } else {
-                byeHeaders
-            }
-        )
+        val bye = if (call.outgoing) {
+            val byeHeaders = call.callHeaders.filterKeys { it != "content-type" }
+            SipRequest(
+                SipMethod.BYE,
+                call.remoteContact,
+                headersParam = if (dialogCseq != null) {
+                    byeHeaders + "CSeq: $dialogCseq BYE".toSipHeadersMap()
+                } else {
+                    byeHeaders
+                }
+            )
+        } else {
+            // We are the UAS: From/To are swapped against the INVITE, Via and the
+            // sec-agree headers are ours, and the route set is the INVITE Record-Route
+            val inv = call.callHeaders
+            val routeSet = inv["record-route"]?.let { mapOf("route" to it) }
+                ?: commonHeaders.filterKeys { it == "route" }
+            SipRequest(
+                SipMethod.BYE,
+                call.remoteContact,
+                headersParam = commonHeaders - "route" +
+                    mapOf(
+                        "from" to inv["to"]!!,
+                        "to" to inv["from"]!!,
+                        "call-id" to inv["call-id"]!!,
+                    ) + routeSet +
+                    """
+                    CSeq: 1 BYE
+                    Max-Forwards: 70
+                    """.toSipHeadersMap()
+            )
+        }
         Rlog.d(TAG, "Sending BYE $bye")
-        synchronized(socket.gWriter()) { socket.gWriter().write(bye.toByteArray()) }
+        writeSafe(bye.toByteArray(), "BYE")
         if (!call.outgoing) {
             rememberTerminatedIncomingCall(call.callHeaders["call-id"]?.getOrNull(0).orEmpty(), "local BYE")
             currentCall = null
@@ -1783,7 +1821,21 @@ a=sendrecv
     )
 
     private fun rememberTerminatedIncomingCall(callId: String, reason: String) {
+        ringingIncomingCallIds.remove(callId)
         terminatedIncomingCallIds.remember(callId, "duplicate INVITE guard: $reason")
+    }
+
+    private val ringingIncomingCallIds =
+        java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
+
+    private fun writeSafe(bytes: ByteArray, what: String): Boolean {
+        return try {
+            synchronized(socket.gWriter()) { socket.gWriter().write(bytes) }
+            true
+        } catch (e: java.io.IOException) {
+            Rlog.w(TAG, "Failed to send $what: $e")
+            false
+        }
     }
 
     private fun wasRecentlyTerminatedIncomingCall(callId: String): Boolean {
@@ -1800,6 +1852,10 @@ a=sendrecv
 
         val contentType = request.headers["content-type"]?.get(0)
         if (contentType != "application/sdp") return 404
+        if (!ringingIncomingCallIds.add(incomingCallId)) {
+            Rlog.d(TAG, "Retransmitted INVITE for $incomingCallId, already handling it")
+            return 100
+        }
         callStopped.set(false)
         callStarted.set(false)
         threadsStarted.set(false)
@@ -1999,7 +2055,7 @@ a=sendrecv
                         body = mySdp
                     )
                 Rlog.d(TAG, "Sending $msg")
-                synchronized(socket.gWriter()) { socket.gWriter().write(msg.toByteArray()) }
+                writeSafe(msg.toByteArray(), "incoming call response")
                 waitPrack(mySeqCounter)
             }
             if (!useReliableProvisional) {
@@ -2016,7 +2072,7 @@ P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=4500620f331a5e06
                         headersParam = myHeaders2
                     )
                 Rlog.d(TAG, "Sending $msg2")
-                synchronized(socket.gWriter()) { socket.gWriter().write(msg2.toByteArray()) }
+                writeSafe(msg2.toByteArray(), "incoming call response")
             }
         }
 

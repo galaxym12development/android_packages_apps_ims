@@ -36,6 +36,7 @@ class PhhMmTelFeature(val slotId: Int) : PhhMmTelFeatureProtected(slotId) {
     val imsSms = PhhImsSms(slotId)
     lateinit var sipHandler: SipHandler
     private var callListener: ImsCallSessionListener? = null
+    private val incomingListeners = java.util.concurrent.ConcurrentHashMap<String, ImsCallSessionListener>()
     fun getSipHandlerOrNull(): SipHandler? = if (this::sipHandler.isInitialized) sipHandler else null
 
     override fun initialize(context: Context?, slotId: Int) {
@@ -192,6 +193,7 @@ class PhhMmTelFeature(val slotId: Int) : PhhMmTelFeatureProtected(slotId) {
         sipHandler.onSmsStatusReportReceived = imsSms::onSmsStatusReportReceived
 
         sipHandler.onIncomingCall = { handle: Object, from: String, extras: Map<String, String> -> 
+            val incomingCallId = extras["call-id"]
             val callProfile = ImsCallProfile(ImsCallProfile.SERVICE_TYPE_NORMAL, ImsCallProfile.CALL_TYPE_VOICE,
                 Bundle(),
                 ImsStreamMediaProfile(
@@ -208,12 +210,24 @@ class PhhMmTelFeature(val slotId: Int) : PhhMmTelFeatureProtected(slotId) {
             callProfile.setCallExtraInt(ImsCallProfile.EXTRA_CNAP, ImsCallProfile.OIR_PRESENTATION_NOT_RESTRICTED)
             notifyIncomingCall(object: ImsCallSessionImplBase() {
                 var mState = State.IDLE
+                var myListener: ImsCallSessionListener? = null
+
+                fun isCurrent() = incomingCallId != null && sipHandler.currentCallId() == incomingCallId
+
+                fun endLocally(code: Int) {
+                    Rlog.d(TAG, "Ending stale session $incomingCallId locally")
+                    mState = State.TERMINATED
+                    incomingCallId?.let { incomingListeners.remove(it) }
+                    myListener?.callSessionTerminated(ImsReasonInfo(code, 0, "Kikoo"))
+                }
                 override fun getCallProfile(): ImsCallProfile {
                     return callProfile
                 }
                 override fun setListener(listener: ImsCallSessionListener) {
                     Rlog.d(TAG, "Setting CallListener to $listener")
                     callListener = listener
+                    myListener = listener
+                    if (incomingCallId != null) incomingListeners[incomingCallId] = listener
                 }
 
                 override fun getCallId(): String {
@@ -241,9 +255,13 @@ class PhhMmTelFeature(val slotId: Int) : PhhMmTelFeatureProtected(slotId) {
 
                 override fun accept(callType: Int, profile: ImsStreamMediaProfile) {
                     Rlog.d(TAG, "Accepting call with profile $profile")
+                    if (!isCurrent()) {
+                        endLocally(ImsReasonInfo.CODE_USER_TERMINATED_BY_REMOTE)
+                        return
+                    }
                     sipHandler.acceptCall()
                     mState = State.ESTABLISHED
-                    callListener?.callSessionInitiated(callProfile)
+                    myListener?.callSessionInitiated(callProfile)
                 }
 
                 override fun deflect(deflectNumber: String?) {
@@ -251,28 +269,41 @@ class PhhMmTelFeature(val slotId: Int) : PhhMmTelFeatureProtected(slotId) {
                 }
 
                 override fun reject(reason: Int) {
+                    if (!isCurrent()) {
+                        endLocally(ImsReasonInfo.CODE_USER_DECLINE)
+                        return
+                    }
                     sipHandler.rejectCall()
                     Rlog.d(TAG, "Rejecting call $reason")
                 }
 
                 override fun terminate(reason: Int) {
                     Rlog.d(TAG, "Terminating call")
+                    if (!isCurrent()) {
+                        endLocally(ImsReasonInfo.CODE_USER_TERMINATED)
+                        return
+                    }
                     sipHandler.myHandler.post {
                         sipHandler.terminateCall()
-                        callListener?.callSessionTerminated(ImsReasonInfo(ImsReasonInfo.CODE_USER_TERMINATED, 0, "Kikoo"))
+                        incomingCallId?.let { incomingListeners.remove(it) }
+                        myListener?.callSessionTerminated(ImsReasonInfo(ImsReasonInfo.CODE_USER_TERMINATED, 0, "Kikoo"))
                     }
                 }
 
             }, Bundle())
         }
         sipHandler.onCancelledCall = { param: Object, s: String, map: Map<String, String> ->
-            Rlog.d(TAG, "Cancelling call")
+            val id = map["call-id"]
+            val byId = id?.let { incomingListeners.remove(it) }
+            // A stale dialog only ends the session it belongs to, never the current call
+            val listener = if (map["stale"] == "1") byId else byId ?: callListener
+            Rlog.d(TAG, "Cancelling call ${id ?: ""} stale=${map["stale"] ?: "0"} listener=${listener != null}")
             val statusCode = map["statusCode"]?.toInt() ?: -1
             if (statusCode >= 400) {
                 val statusMessage = map["statusString"] ?: "Kikoo"
-                callListener?.callSessionTerminated(ImsReasonInfo(ImsReasonInfo.CODE_NETWORK_REJECT, 0, statusMessage))
+                listener?.callSessionTerminated(ImsReasonInfo(ImsReasonInfo.CODE_NETWORK_REJECT, 0, statusMessage))
             } else {
-                callListener?.callSessionTerminated(
+                listener?.callSessionTerminated(
                     ImsReasonInfo(
                         ImsReasonInfo.CODE_USER_TERMINATED_BY_REMOTE,
                         0,
