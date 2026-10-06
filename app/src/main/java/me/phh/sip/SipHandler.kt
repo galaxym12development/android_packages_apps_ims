@@ -492,20 +492,25 @@ class SipHandler(val ctxt: Context) {
                 }
             }
         }
+        // Each listener owns the server socket it was started with; connect()
+        // replaces the fields on reconnect and starts new listeners
+        val tcpServer = serverSocket
         CoroutineScope(Dispatchers.IO).launch {
             while (true) {
                 val client = try {
-                    serverSocket.serverSocket.accept()
+                    tcpServer.serverSocket.accept()
                 } catch (t: SocketTimeoutException) {
                     // Transient: accept() unblocked without a peer. Keep listening.
                     Rlog.d(TAG, "TCP server accept() timed out, continuing", t)
                     continue
                 } catch (t: Throwable) {
-                    if (serverSocket.serverSocket.isClosed) {
-                        Rlog.e(TAG, "TCP server socket closed, listener stopping", t)
+                    if (tcpServer.serverSocket.isClosed || tcpServer !== serverSocket) {
+                        Rlog.e(TAG, "TCP server socket closed or replaced, listener stopping", t)
+                        try { tcpServer.serverSocket.close() } catch (_: Throwable) {}
                         break
                     }
-                    Rlog.d(TAG, "TCP server accept() error, continuing", t)
+                    Rlog.d(TAG, "TCP server accept() error, retrying", t)
+                    Thread.sleep(1000)
                     continue
                 }
                 try {
@@ -519,6 +524,7 @@ class SipHandler(val ctxt: Context) {
                 }
             }
         }
+        val udpServer = serverSocketUdp
         CoroutineScope(Dispatchers.IO).launch {
             val bufferIn = ByteArray(128 * 1024)
             val dgramPacketIn = DatagramPacket(bufferIn, bufferIn.size)
@@ -526,7 +532,7 @@ class SipHandler(val ctxt: Context) {
             while (true) {
                 try {
                     dgramPacketIn.length = bufferIn.size
-                    serverSocketUdp.socket.receive(dgramPacketIn)
+                    udpServer.socket.receive(dgramPacketIn)
                     Rlog.d(TAG, "Received dgram packet")
                     val baIs = ByteArrayInputStream(dgramPacketIn.data, dgramPacketIn.offset, dgramPacketIn.length)
                     val reader = baIs.sipReader()
@@ -537,12 +543,13 @@ class SipHandler(val ctxt: Context) {
                     val writerOut = writer.toByteArray()
                     if (writerOut.isNotEmpty()) {
                         val dgramPacketOut = DatagramPacket(writerOut, writerOut.size, dgramPacketIn.address, dgramPacketIn.port)
-                        serverSocketUdp.socket.send(dgramPacketOut)
+                        udpServer.socket.send(dgramPacketOut)
                     }
                     writer.reset()
                 } catch (t: Throwable) {
-                    if (serverSocketUdp.socket.isClosed) {
-                        Rlog.e(TAG, "UDP server socket closed, listener stopping", t)
+                    if (udpServer.socket.isClosed || udpServer !== serverSocketUdp) {
+                        Rlog.e(TAG, "UDP server socket closed or replaced, listener stopping", t)
+                        try { udpServer.socket.close() } catch (_: Throwable) {}
                         break
                     }
                     Rlog.d(TAG, "UDP server packet error, continuing receive loop", t)
