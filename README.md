@@ -52,9 +52,6 @@ framework APIs (`Rlog`, `MmTelFeature`, `ImsConfigImplBase`, etc.) without patch
 The following shows the full diff needed in your device tree. Adapt paths and package
 names for your device.
 
-If you have the same device, apply [the patch](./device_a21s_common.patch)
-to [`device_a21s_common`](https://github.com/LineageOS/android_device_samsung_a21s-common) repository.
-
 ### `common.mk` (or `device.mk`)
 
 ```makefile
@@ -185,9 +182,6 @@ No binary patching or framework patches are needed.
 
 **None.** Earlier versions required patching `libaudioproxy.so` to change the
 ALSA device selection, but the real fix is in the mixer path configuration above.
-
-Reverse-engineering notes for the Samsung audio HAL are kept in
-[RE/README.md](RE/README.md) for reference.
 
 ## Required framework patches
 
