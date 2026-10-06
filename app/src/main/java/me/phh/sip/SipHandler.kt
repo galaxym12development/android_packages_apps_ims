@@ -47,10 +47,10 @@ class SipHandler(val ctxt: Context) {
     private val connectivityManager: ConnectivityManager
     private val ipSecManager: IpSecManager
     init {
-        subscriptionManager = ctxt.getSystemService(SubscriptionManager::class.java)
-        telephonyManager = ctxt.getSystemService(TelephonyManager::class.java)
-        connectivityManager = ctxt.getSystemService(ConnectivityManager::class.java)
-        ipSecManager = ctxt.getSystemService(IpSecManager::class.java)
+        subscriptionManager = ctxt.getSystemService(SubscriptionManager::class.java)!!
+        telephonyManager = ctxt.getSystemService(TelephonyManager::class.java)!!
+        connectivityManager = ctxt.getSystemService(ConnectivityManager::class.java)!!
+        ipSecManager = ctxt.getSystemService(IpSecManager::class.java)!!
     }
 
     @SuppressLint("MissingPermission")
@@ -995,7 +995,7 @@ a=sendrecv
             // the baseband PCM path (pcmC0D110c) that produces silence for software IMS.
             // setPreferredDevice overrides HAL source-based routing while keeping
             // VOICE_COMMUNICATION semantics (call-mode output path stays correct).
-            val audioManager = ctxt.getSystemService(android.media.AudioManager::class.java)
+            val audioManager = ctxt.getSystemService(android.media.AudioManager::class.java)!!
             val builtinMic = audioManager.getDevices(android.media.AudioManager.GET_DEVICES_INPUTS)
                 .firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC }
             if (builtinMic != null) {
@@ -2084,7 +2084,7 @@ P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=4500620f331a5e06
         } catch (t:Throwable) { false }
 
         val smsManager =
-            ctxt.getSystemService(SmsManager::class.java).createForSubscriptionId(subId)
+            ctxt.getSystemService(SmsManager::class.java)!!.createForSubscriptionId(subId)
         val smscIdentity = try {
             val i = smsManager
                 .javaClass.getMethod("getSmscIdentity")

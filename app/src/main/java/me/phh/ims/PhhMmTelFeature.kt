@@ -47,8 +47,8 @@ class PhhMmTelFeature(val slotId: Int) : PhhMmTelFeatureProtected(slotId) {
         // subscription changes and gate on simOperator being readable: SipHandler reads
         // simOperator/subscriberId in its constructor, so empty operator string would
         // crash it. SipHandler.getVolteNetwork() handles the network-up wait itself.
-        val smgr = mContext.getSystemService(SubscriptionManager::class.java)
-        val baseTm = mContext.getSystemService(TelephonyManager::class.java)
+        val smgr = mContext.getSystemService(SubscriptionManager::class.java)!!
+        val baseTm = mContext.getSystemService(TelephonyManager::class.java)!!
         smgr.addOnSubscriptionsChangedListener(
             Executors.newSingleThreadExecutor(),
             object : SubscriptionManager.OnSubscriptionsChangedListener() {
