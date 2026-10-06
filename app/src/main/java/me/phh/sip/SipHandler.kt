@@ -570,8 +570,14 @@ class SipHandler(val ctxt: Context) {
                     Rlog.d(TAG, "IMS network unavailable")
                 }
 
-                override fun onLost(network: Network) {
+                override fun onLost(lost: Network) {
                     Rlog.d(TAG, "IMS network lost")
+                    if (this@SipHandler::network.isInitialized && lost == network) {
+                        imsReady = false
+                        if (this@SipHandler::socket.isInitialized) {
+                            try { socket.close() } catch (t: Throwable) { }
+                        }
+                    }
                 }
 
                 override fun onBlockedStatusChanged(network: Network, blocked: Boolean) {
@@ -609,7 +615,8 @@ class SipHandler(val ctxt: Context) {
 
                 override fun onAvailable(_network: Network) {
                     Rlog.d(TAG, "Got IMS network.")
-                    if (!this@SipHandler::network.isInitialized || abandonnedBecauseOfNoPcscf) {
+                    if (!this@SipHandler::network.isInitialized || abandonnedBecauseOfNoPcscf ||
+                            _network != network) {
                         network = _network
                         thread {
                             Thread.sleep(4000)
@@ -1707,7 +1714,7 @@ a=sendrecv
                                 newSdp
                             )
                         Rlog.d(TAG, "Sending $msg2")
-                        synchronized(socket.gWriter()) { socket.gWriter().write(msg2.toByteArray()) }
+                        writeSafe(msg2.toByteArray(), "UPDATE")
                     }
 
                     return@setResponseCallback false
@@ -1723,7 +1730,15 @@ a=sendrecv
                 false // Return true when we want to stop receiving messages for that call
             }
             Rlog.d(TAG, "Sending $msg")
-            synchronized(socket.gWriter()) { socket.gWriter().write(msg.toByteArray()) }
+            if (!writeSafe(msg.toByteArray(), "INVITE")) {
+                // Control socket died under us (IMS bearer changed). Fail the call
+                // and let the reader loop reconnect instead of crashing the service.
+                rtpSocket.close()
+                onCancelledCall?.invoke(Object(), "",
+                    mapOf("statusCode" to "503", "statusString" to "IMS connection lost"))
+                imsReady = false
+                try { socket.close() } catch (t: Throwable) { }
+            }
         }
     }
 
