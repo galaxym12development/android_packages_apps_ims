@@ -465,7 +465,7 @@ class SipHandler(val ctxt: Context) {
         setRequestCallback(SipMethod.INVITE, ::handleCall)
         setRequestCallback(SipMethod.PRACK, ::handlePrack)
         setRequestCallback(SipMethod.CANCEL, ::handleCancel)
-        setRequestCallback(SipMethod.BYE, ::handleCancel)
+        setRequestCallback(SipMethod.BYE, ::handleBye)
         setRequestCallback(SipMethod.UPDATE, ::handleUpdate)
         handleResponse(regReply)
 
@@ -903,6 +903,23 @@ a=sendrecv
         rememberTerminatedIncomingCall(callId, "remote CANCEL")
 
         // We're supposed to add an additional answer SIP/2.0 487 Request Terminated
+        onCancelledCall?.invoke(Object(), "", emptyMap())
+        runPendingReconnectIfCallFinished()
+        return 200
+    }
+
+    fun handleBye(request: SipRequest): Int {
+        val callId = request.headers["call-id"]?.getOrNull(0).orEmpty()
+        val call = currentCall
+        if (call == null || call.callHeaders["call-id"]?.getOrNull(0) != callId) {
+            Rlog.d(TAG, "BYE for unknown dialog $callId")
+            return 200
+        }
+        Rlog.d(TAG, "Remote BYE for $callId")
+        callStopped.set(true)
+        prackWaitTracker.clearAndNotifyAll()
+        if (!call.outgoing) rememberTerminatedIncomingCall(callId, "remote BYE")
+        currentCall = null
         onCancelledCall?.invoke(Object(), "", emptyMap())
         runPendingReconnectIfCallFinished()
         return 200

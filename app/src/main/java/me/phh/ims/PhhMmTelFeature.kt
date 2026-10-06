@@ -35,6 +35,7 @@ class PhhMmTelFeature(val slotId: Int) : PhhMmTelFeatureProtected(slotId) {
 
     val imsSms = PhhImsSms(slotId)
     lateinit var sipHandler: SipHandler
+    private var callListener: ImsCallSessionListener? = null
     fun getSipHandlerOrNull(): SipHandler? = if (this::sipHandler.isInitialized) sipHandler else null
 
     override fun initialize(context: Context?, slotId: Int) {
@@ -122,6 +123,7 @@ class PhhMmTelFeature(val slotId: Int) : PhhMmTelFeatureProtected(slotId) {
             override fun setListener(listener: ImsCallSessionListener) {
                 Rlog.d(TAG, "Setting CallListener to $listener")
                 mListener = listener
+                callListener = listener
             }
 
             override fun reject(reason: Int) {
@@ -189,7 +191,6 @@ class PhhMmTelFeature(val slotId: Int) : PhhMmTelFeatureProtected(slotId) {
         sipHandler.onSmsReceived = imsSms::onSmsReceived
         sipHandler.onSmsStatusReportReceived = imsSms::onSmsStatusReportReceived
 
-        var callListener: ImsCallSessionListener? = null
         sipHandler.onIncomingCall = { handle: Object, from: String, extras: Map<String, String> -> 
             val callProfile = ImsCallProfile(ImsCallProfile.SERVICE_TYPE_NORMAL, ImsCallProfile.CALL_TYPE_VOICE,
                 Bundle(),
