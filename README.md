@@ -21,7 +21,7 @@ After cloning (whether via `repo sync`, `git clone`, or roomservice), initialize
 the `rnnoise` submodule — `repo sync` does not do this automatically:
 
 ```sh
-cd packages/apps/PhhIms
+cd packages/apps/Ims
 git submodule update --init app/jni/rnnoise
 ```
 
@@ -31,14 +31,14 @@ Add this repo to your local manifest or `lineage.dependencies`:
 
 ```xml
 <!-- .repo/local_manifests/roomservice.xml -->
-<project path="packages/apps/PhhIms" remote="github" name="amikhasenko/ims" revision="main" />
+<project path="packages/apps/Ims" remote="github" name="amikhasenko/ims" revision="main" />
 ```
 
 ```json
 // lineage.dependencies
 {
     "repository": "amikhasenko/ims",
-    "target_path": "packages/apps/PhhIms",
+    "target_path": "packages/apps/Ims",
     "branch": "main"
 }
 ```
@@ -71,7 +71,7 @@ PRODUCT_PROPERTY_OVERRIDES += \
     persist.dbg.allow_ims_off=1
 
 PRODUCT_PACKAGES += \
-    PhhIms
+    Ims
 
 PRODUCT_COPY_FILES += \
     $(COMMON_PATH)/privapp-permissions-me.phh.ims.xml:$(TARGET_COPY_OUT_SYSTEM)/etc/permissions/privapp-permissions-me.phh.ims.xml

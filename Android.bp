@@ -2,7 +2,7 @@
 
 // IMS service providing VoLTE via a SIP/IMS stack
 android_app {
-    name: "PhhIms",
+    name: "Ims",
 
     srcs: [
         "app/src/main/java/**/*.kt",
@@ -26,14 +26,14 @@ android_app {
     use_embedded_native_libs: true,
 
     required: [
-        "PhhImsOverlay",
-        "PhhImsFrameworkOverlay",
+        "ImsOverlay",
+        "ImsFrameworkOverlay",
     ],
 }
 
 // Static RRO: registers me.phh.ims as the IMS MmTel service with the Phone app
 runtime_resource_overlay {
-    name: "PhhImsOverlay",
+    name: "ImsOverlay",
     resource_dirs: ["overlay/res"],
     manifest: "overlay/AndroidManifest.xml",
     certificate: "platform",
@@ -41,7 +41,7 @@ runtime_resource_overlay {
 }
 
 runtime_resource_overlay {
-    name: "PhhImsFrameworkOverlay",
+    name: "ImsFrameworkOverlay",
     resource_dirs: ["overlay-framework/res"],
     manifest: "overlay-framework/AndroidManifest.xml",
     certificate: "platform",
