@@ -935,7 +935,7 @@ a=sendrecv
                 body = mySdp
             )
         Rlog.d(TAG, "Replying back with $reply")
-        synchronized(socket.gWriter()) { socket.gWriter().write(reply.toByteArray()) }
+        writeSafe(reply.toByteArray(), "handleUpdate")
 
         if(call?.outgoing == false) {
             val myHeaders2 = call.callHeaders - "rseq" - "content-type" - "require"
@@ -946,7 +946,7 @@ a=sendrecv
                     headersParam = myHeaders2
                 )
             Rlog.d(TAG, "Sending $msg2")
-            synchronized(socket.gWriter()) { socket.gWriter().write(msg2.toByteArray()) }
+            writeSafe(msg2.toByteArray(), "handleUpdate")
         }
 
         return 0
@@ -1310,7 +1310,7 @@ a=sendrecv
                     body = finalBody
                 )
             Rlog.d(TAG, "Sending $msg3")
-            synchronized(socket.gWriter()) { socket.gWriter().write(msg3.toByteArray()) }
+            writeSafe(msg3.toByteArray(), "acceptCall")
 
             callStarted.set(true)
         }
@@ -1340,7 +1340,7 @@ a=sendrecv
                     """.toSipHeadersMap()
             )
         Rlog.d(TAG, "Sending $msg")
-        synchronized(socket.gWriter()) { socket.gWriter().write(msg.toByteArray()) }
+        writeSafe(msg.toByteArray(), "prack")
     }
 
     fun rejectCall() {
@@ -1356,7 +1356,7 @@ a=sendrecv
                     headersParam = myHeaders
                 )
             Rlog.d(TAG, "Sending $msg")
-            synchronized(socket.gWriter()) { socket.gWriter().write(msg.toByteArray()) }
+            writeSafe(msg.toByteArray(), "rejectCall")
 
             callStopped.set(true)
             if (!call.outgoing) {
@@ -1628,7 +1628,7 @@ a=sendrecv
                                 """.toSipHeadersMap()
                         )
                     Rlog.d(TAG, "Sending $msg2")
-                    synchronized(socket.gWriter()) { socket.gWriter().write(msg2.toByteArray()) }
+                    writeSafe(msg2.toByteArray(), "call")
                     callStarted.set(true)
                     // Update dialog route set from the confirmed 200 OK (RFC 3261 §12.1.2)
                     // so that subsequent in-dialog requests (BYE, UPDATE) use the correct route.
