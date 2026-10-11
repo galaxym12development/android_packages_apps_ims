@@ -158,19 +158,28 @@ internal object SipAmrRtpPayload {
 
         val cmr = 0x0f // no codec-mode request
         val f = 0      // one frame only
+        val speechBits = speechBitsForFt(audioCodec, ft) ?: return null
 
-        val payloadByte0 = (cmr shl 4) or (f shl 3) or (ft shr 1)
-        val payloadByte1 = ((ft and 1) shl 7) or
-            (q shl 6) or
-            (storageFrame[1].toUByte().toInt() shr 2)
-
-        val payloadRest = (1 until frameSize - 1).map { i ->
-            val lo = (storageFrame[i].toUByte().toInt() and 0x03) shl 6
-            val hi = (storageFrame[i + 1].toUByte().toInt() shr 2) and 0x3f
-            lo or hi
-        }.map { it.toByte() }.toByteArray()
-
-        val payload = byteArrayOf(payloadByte0.toByte(), payloadByte1.toByte()) + payloadRest
+        // 10 header bits then every speech bit, zero padded to an octet. Shifting
+        // whole storage bytes would drop the last bits whenever speechBits % 8
+        // is 0 or 7 (AMR-NB 4.75 and SID, AMR-WB SID).
+        val payload = ByteArray((10 + speechBits + 7) / 8)
+        var bit = 0
+        fun put(value: Int, count: Int) {
+            for (i in count - 1 downTo 0) {
+                if (((value shr i) and 1) != 0) {
+                    payload[bit / 8] = (payload[bit / 8].toInt() or (0x80 ushr (bit % 8))).toByte()
+                }
+                bit++
+            }
+        }
+        put(cmr, 4)
+        put(f, 1)
+        put(ft, 4)
+        put(q, 1)
+        for (i in 0 until speechBits) {
+            put(storageFrame[1 + i / 8].toInt() shr (7 - i % 8), 1)
+        }
 
         return buildRtpHeader(
             payloadType = payloadType,
