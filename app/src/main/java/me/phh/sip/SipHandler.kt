@@ -70,18 +70,16 @@ class SipHandler(val ctxt: Context) {
         "208010" -> true // 20810 can do TCP and UDP. use this for testing
         else -> false
     }
-    private val isJio = mcc == "405" && mnc.toIntOrNull().let { it == 840 || it in 854..874 }
-    private val isVivoBr = mcc + mnc in listOf("724006", "724010", "724011", "724023", "724089")
+    // Stock Samsung IMS settings for this PLMN, null when stock has no voice profile
+    private val carrier = CarrierProfiles.forPlmn(mcc + mnc)
     // Samsung addresses the SMSC with a TEL URI on Jio, a SIP URI elsewhere
-    val smscTelUri = isJio
+    val smscTelUri = carrier?.smscTel ?: false
     // Voice media settings from the stock imsprofile.json: audio_as/audio_rs/
     // audio_rr, and the local qos strength we offer when use_precondition is set
     private data class MediaSettings(val bwAs: Int, val bwRs: Int, val bwRr: Int, val precondition: String?)
-    private val media = when {
-        isJio -> MediaSettings(80, 800, 2400, null)
-        isVivoBr -> MediaSettings(41, 512, 1537, "mandatory")
-        else -> MediaSettings(38, 0, 0, "optional")
-    }
+    private val media = carrier?.let {
+        MediaSettings(it.bwAs, it.bwRs, it.bwRr, if (it.precondition) "mandatory" else null)
+    } ?: MediaSettings(38, 0, 0, "optional")
     private val mediaBandwidth = "b=AS:${media.bwAs}\nb=RS:${media.bwRs}\nb=RR:${media.bwRr}"
 
     private val amrWbMediaCodecAvailable: Boolean by lazy {
@@ -1644,13 +1642,14 @@ a=sendrecv
             //rtpSocket.connect(rtpRemoteAddr, rtpRemotePort.toInt())
             Rlog.d(TAG, "RTP socket created for outgoing call: local=${rtpSocket.localAddress}:${rtpSocket.localPort}")
 
-            val amrNbTrack = 97
-            val amrWbTrack = 98
-            val dtmfNbTrack = 100
-            val dtmfWbTrack = 101
+            // Stock payload numbers for this carrier when known
+            val amrNbTrack = carrier?.amrNbPayload ?: 97
+            val amrWbTrack = carrier?.amrWbPayload ?: 98
+            val dtmfNbTrack = carrier?.dtmfNbPayload ?: 100
+            val dtmfWbTrack = carrier?.dtmfWbPayload ?: 101
             val amrNbFmtp = "fmtp:$amrNbTrack mode-change-capability=2;octet-align=0;max-red=0"
             val amrWbFmtp = "fmtp:$amrWbTrack octet-align=0;mode-change-capability=2;max-red=0"
-            val offerAmrWb = amrWbMediaCodecAvailable
+            val offerAmrWb = amrWbMediaCodecAvailable && carrier?.amrWb != false
             val allTracks = if (offerAmrWb) {
                 listOf(amrWbTrack, amrNbTrack, dtmfWbTrack, dtmfNbTrack)
             } else {
