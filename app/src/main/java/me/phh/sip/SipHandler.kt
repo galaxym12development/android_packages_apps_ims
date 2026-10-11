@@ -151,11 +151,28 @@ class SipHandler(val ctxt: Context) {
         if (pendingReconnect && !callStarted.get()) {
             pendingReconnect = false
             Rlog.w(TAG, "Running deferred IMS reconnect now that call has finished")
-            try { connect() } catch (t: Throwable) {
-                Rlog.e(TAG, "Deferred reconnect failed", t)
-                imsFailureCallback?.invoke()
-            }
+            reconnect()
         }
+    }
+
+    private var registered = false
+    private var reconnectDelayMs = 5_000L
+    private fun reconnect() {
+        try { connect() } catch (t: Throwable) {
+            Rlog.e(TAG, "Reconnect failed", t)
+        }
+        if (registered || connectInProgress || abandonnedBecauseOfNoPcscf) {
+            reconnectDelayMs = 5_000L
+            return
+        }
+        imsFailureCallback?.invoke()
+        if (connectivityManager.getLinkProperties(network) == null) {
+            Rlog.w(TAG, "IMS network is gone, waiting for it to come back")
+            return
+        }
+        Rlog.w(TAG, "Reconnecting in $reconnectDelayMs ms")
+        myHandler.postDelayed({ thread { if (!registered) reconnect() } }, reconnectDelayMs)
+        reconnectDelayMs = minOf(reconnectDelayMs * 2, 120_000L)
     }
     var imsReadyCallback: (() -> Unit)? = null
     var imsFailureCallback: (() -> Unit)? = null
@@ -265,6 +282,7 @@ class SipHandler(val ctxt: Context) {
             return
         }
         connectInProgress = true
+        registered = false
         try {
         abandonnedBecauseOfNoPcscf = false
         Rlog.d(TAG, "Trying to connect to SIP server")
@@ -490,28 +508,31 @@ class SipHandler(val ctxt: Context) {
         setRequestCallback(SipMethod.BYE, ::handleBye)
         setRequestCallback(SipMethod.UPDATE, ::handleUpdate)
         handleResponse(regReply)
+        registered = true
 
         // two ways we'll get incoming messages:
         // - reply to normal socket (just read forever)
         // - connection to server socket
         // start both in threads as we're only called here from network
         // callback from which it's better to return
+        val mainSocket = socket
         CoroutineScope(Dispatchers.IO).launch {
             try {
-                while (parseMessage(socket.gReader(), socket.gWriter())) { }
+                while (parseMessage(mainSocket.gReader(), mainSocket.gWriter())) { }
                 Rlog.w(TAG, "Main socket got EOF, reconnecting")
             } catch(t: Throwable) {
                 Rlog.w(TAG, "Got exception in main/control socket, reconnecting", t)
             }
-            socket.close()
+            mainSocket.close()
+            // connect() closed it for a newer connection
+            if (mainSocket !== socket) return@launch
+            registered = false
+            imsReady = false
             if (currentCall != null) {
                 pendingReconnect = true
                 Rlog.w(TAG, "Deferring IMS reconnect because a call is active/pending")
             } else {
-                try { connect() } catch (t: Throwable) {
-                    Rlog.e(TAG, "Reconnect after main socket loss failed", t)
-                    imsFailureCallback?.invoke()
-                }
+                reconnect()
             }
         }
         // Each listener owns the server socket it was started with; connect()
