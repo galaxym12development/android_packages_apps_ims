@@ -247,6 +247,37 @@ class SipHandler(val ctxt: Context) {
     private var smsToken = 0
     private val smsHeadersMap = mutableMapOf<Int, smsHeaders>()
 
+    private data class PendingOutgoingSms(
+        val callId: String,
+        val ref: Int,
+        val successCb: () -> Unit,
+        val failCb: () -> Unit,
+    )
+    private val pendingOutgoingSmsByCallId = mutableMapOf<String, PendingOutgoingSms>()
+    private val pendingOutgoingSmsByRef = mutableMapOf<Int, PendingOutgoingSms>()
+
+    private fun removePendingOutgoingSms(callId: String?, ref: Int?): PendingOutgoingSms? =
+        smsLock.withLock {
+            val pending = callId?.let { pendingOutgoingSmsByCallId[it] }
+                ?: ref?.let { pendingOutgoingSmsByRef[it] }
+            if (pending != null) {
+                pendingOutgoingSmsByCallId.remove(pending.callId)
+                pendingOutgoingSmsByRef.remove(pending.ref, pending)
+            }
+            pending
+        }
+
+    private fun completePendingOutgoingSms(callId: String?, ref: Int?, success: Boolean, why: String): Boolean {
+        val pending = removePendingOutgoingSms(callId, ref) ?: return false
+        Rlog.d(TAG, "Completing outgoing SMS: success=$success ($why) ref=${pending.ref} callId=${pending.callId}")
+        try {
+            if (success) pending.successCb() else pending.failCb()
+        } catch (t: Throwable) {
+            Rlog.d(TAG, "Failed reporting outgoing SMS result", t)
+        }
+        return true
+    }
+
     // Reconnect the control socket if no REGISTER response arrives within this window.
     // Mavenir P-CSCF can silently drop the control socket mid-exchange; without this,
     // periodic re-REGISTER would hang forever (response never parsed) and the framework
@@ -2252,14 +2283,20 @@ P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=4500620f331a5e06
                 }
             }
             SmsType.RP_ACK_FROM_NETWORK -> {
-                try {
-                    onSmsStatusReportReceived?.invoke(sms.ref.toInt(), "3gpp", ByteArray(2))
-                } catch(t: Throwable) {
-                    Rlog.d(TAG, "Failed sending SMS ACK to framework", t)
+                if (!completePendingOutgoingSms(request.headers["in-reply-to"]?.getOrNull(0),
+                        sms.ref.toInt() and 0xff, true, "RP-ACK")) {
+                    try {
+                        onSmsStatusReportReceived?.invoke(sms.ref.toInt() and 0xff, "3gpp", ByteArray(2))
+                    } catch(t: Throwable) {
+                        Rlog.d(TAG, "Failed sending SMS ACK to framework", t)
+                    }
                 }
             }
             SmsType.RP_ERROR_FROM_NETWORK -> {
-                Rlog.d(TAG, "SMS error from network")
+                if (!completePendingOutgoingSms(request.headers["in-reply-to"]?.getOrNull(0),
+                        sms.ref.toInt() and 0xff, false, "RP-ERROR")) {
+                    Rlog.d(TAG, "SMS error from network without matching pending outgoing SMS")
+                }
             }
             else -> return 500
         }
@@ -2375,17 +2412,31 @@ P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=4500620f331a5e06
                     """.toSipHeadersMap(),
                 data
             )
-        setResponseCallback(
-            msg.headers["call-id"]!![0],
-            { resp: SipResponse ->
-                if (resp.statusCode == 200 || resp.statusCode == 202) {
-                    successCb()
-                } else {
-                    failCb()
+        // 200/202 only means the IMS core took the MESSAGE, the SMSC answers
+        // with RP-ACK or RP-ERROR in a MESSAGE of its own
+        val callId = msg.headers["call-id"]!![0]
+        val pending = PendingOutgoingSms(callId, ref and 0xff, successCb, failCb)
+        smsLock.withLock {
+            pendingOutgoingSmsByCallId[callId] = pending
+            pendingOutgoingSmsByRef[pending.ref] = pending
+        }
+        // TR1M (TS 24.011)
+        myHandler.postDelayed({
+            completePendingOutgoingSms(callId, null, false, "RP timeout")
+        }, 40_000L)
+        setResponseCallback(callId) { resp: SipResponse ->
+            when {
+                resp.statusCode < 200 -> false
+                resp.statusCode < 300 -> {
+                    Rlog.d(TAG, "Outgoing SMS accepted with ${resp.statusCode}, waiting for RP result ref=${pending.ref}")
+                    true
                 }
-                true
+                else -> {
+                    completePendingOutgoingSms(callId, null, false, "SIP ${resp.statusCode}")
+                    true
+                }
             }
-        )
+        }
         Rlog.d(TAG, "Sending $msg")
         synchronized(socket.gWriter()) { socket.gWriter().write(msg.toByteArray()) }
     }
