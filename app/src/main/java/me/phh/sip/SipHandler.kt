@@ -74,6 +74,15 @@ class SipHandler(val ctxt: Context) {
     private val isVivoBr = mcc + mnc in listOf("724006", "724010", "724011", "724023", "724089")
     // Samsung addresses the SMSC with a TEL URI on Jio, a SIP URI elsewhere
     val smscTelUri = isJio
+    // Voice media settings from the stock imsprofile.json: audio_as/audio_rs/
+    // audio_rr, and the local qos strength we offer when use_precondition is set
+    private data class MediaSettings(val bwAs: Int, val bwRs: Int, val bwRr: Int, val precondition: String?)
+    private val media = when {
+        isJio -> MediaSettings(80, 800, 2400, null)
+        isVivoBr -> MediaSettings(41, 512, 1537, "mandatory")
+        else -> MediaSettings(38, 0, 0, "optional")
+    }
+    private val mediaBandwidth = "b=AS:${media.bwAs}\nb=RS:${media.bwRs}\nb=RR:${media.bwRr}"
     val forceSmsc = when(mcc + mnc) {
         "450006" -> "821080010585" // LG U+
         else -> null
@@ -979,14 +988,9 @@ v=0
 o=- 1 2 IN $ipType ${socket.gLocalAddr().hostAddress}
 s=phh voice call
 c=IN $ipType ${socket.gLocalAddr().hostAddress}
-b=AS:38
-b=RS:0
-b=RR:0
 t=0 0
 m=audio ${call.rtpSocket.localPort} RTP/AVP ${allTracks.joinToString(" ")}
-b=AS:38
-b=RS:0
-b=RR:0
+$mediaBandwidth
 a=rtpmap:${call.amrTrack} AMR/8000/1
 a=rtpmap:${call.dtmfTrack} telephone-event/8000
 a=${call.amrTrackDesc}
@@ -1607,26 +1611,22 @@ v=0
 o=- 1 2 IN $ipType ${socket.gLocalAddr().hostAddress}
 s=phh voice call
 c=IN $ipType ${socket.gLocalAddr().hostAddress}
-b=AS:38
-b=RS:0
-b=RR:0
 t=0 0
 m=audio ${rtpSocket.localPort} RTP/AVP ${allTracks.joinToString(" ")}
-b=AS:38
-b=RS:0
-b=RR:0
+$mediaBandwidth
 a=ptime:20
 a=maxptime:240
 a=rtpmap:$amrTrack AMR/8000/1
 a=rtpmap:$dtmfTrack telephone-event/8000
 a=fmtp:$amrTrack mode-change-capability=2;octet-align=0;max-red=0
 a=fmtp:$dtmfTrack 0-15
+${if (media.precondition != null) """
 a=curr:qos local none
 a=curr:qos remote none
-a=des:qos optional local sendrecv
-a=des:qos optional remote sendrecv
+a=des:qos ${media.precondition} local sendrecv
+a=des:qos optional remote sendrecv""".trimIndent() else ""}
 a=sendrecv
-                       """.trim().sdpLines()
+                       """.trim().lines().filter { it.isNotEmpty() }.joinToString("\n").sdpLines()
 
             val normalizedPhoneNumber = PhoneNumberUtils.stripSeparators(phoneNumber).trim()
             val to = if (normalizedPhoneNumber.startsWith("+")) {
@@ -1653,13 +1653,13 @@ a=sendrecv
                     P-Preferred-Identity: <$mySip>
                     P-Asserted-Identity: <$mySip>
                     Expires: 7200
-                    Require: sec-agree
+                    Require: sec-agree${if (media.precondition == "mandatory") ", precondition" else ""}
                     Proxy-Require: sec-agree
                     Allow: INVITE, ACK, CANCEL, BYE, UPDATE, REFER, NOTIFY, MESSAGE, PRACK, OPTIONS
                     P-Early-Media: supported
                     Content-Type: application/sdp
                     Session-Expires: 900
-                    Supported: 100rel, replaces, timer, precondition
+                    Supported: 100rel, replaces, timer${if (media.precondition != null) ", precondition" else ""}
                     Accept: application/sdp
                     Min-SE: 90
                     Accept-Contact: *;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"
@@ -2152,14 +2152,9 @@ v=0
 o=$owner 1 2 IN $ipType ${socket.gLocalAddr().hostAddress}
 s=phh voice call
 c=IN $ipType ${socket.gLocalAddr().hostAddress}
-b=AS:38
-b=RS:0
-b=RR:0
 t=0 0
 m=audio ${rtpSocket.localPort} RTP/AVP ${allTracks.joinToString(" ")}
-b=AS:38
-b=RS:0
-b=RR:0
+$mediaBandwidth
 a=$amrTrackDesc
 a=ptime:20
 a=maxptime:240
@@ -2173,7 +2168,7 @@ a=des:qos mandatory local sendrecv
 a=des:qos mandatory remote sendrecv
 a=conf:qos remote sendrecv""".trimIndent() else ""}
 a=sendrecv
-                       """.trim()).sdpLines()
+                       """.trim()).lines().filter { it.isNotEmpty() }.joinToString("\n").sdpLines()
 
             // Generate a single local tag for all responses in this dialog (RFC 3261 §12.1.1)
             val localToTag = randomBytes(6).toHex()
