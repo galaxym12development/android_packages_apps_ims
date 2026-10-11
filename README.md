@@ -5,8 +5,9 @@ It has a better structure, more fixes, and is hardware-agnostic. This repo is ke
 primarily as a guide for device tree integration and audio issue debugging on devices
 with similar Samsung binaries.
 
-Open-source SIP/IMS stack for LineageOS, based on [phhusson/ims](https://github.com/phhusson/ims).
-Tested on Samsung Galaxy A21s (SM-A217F) running LineageOS 23.2 (Android 16) with O2 Germany.
+Open-source SIP/IMS stack for LineageOS, based on [phhusson/ims](https://github.com/phhusson/ims)
+and [amikhasenko/ims](https://github.com/amikhasenko/ims). This fork is used by the LineageOS 21
+trees for the Samsung Galaxy M12 (m12) and Galaxy A12 (a12s).
 
 ## How it works
 
@@ -15,31 +16,21 @@ The Android telephony framework requires a privileged system app that implements
 provides a pure-userspace SIP/IMS stack: it opens the IMS bearer, discovers the P-CSCF,
 performs SIP AKA registration, and handles voice calls over RTP.
 
-## Prerequisites
-
-After cloning (whether via `repo sync`, `git clone`, or roomservice), initialize
-the `rnnoise` submodule — `repo sync` does not do this automatically:
-
-```sh
-cd packages/apps/Ims
-git submodule update --init app/jni/rnnoise
-```
-
 ## Building in-tree (LineageOS / AOSP)
 
 Add this repo to your local manifest or `lineage.dependencies`:
 
 ```xml
 <!-- .repo/local_manifests/roomservice.xml -->
-<project path="packages/apps/Ims" remote="github" name="amikhasenko/ims" revision="main" />
+<project path="packages/apps/Ims" remote="github" name="galaxym12development/android_packages_apps_ims" revision="lineage-21" />
 ```
 
 ```json
 // lineage.dependencies
 {
-    "repository": "amikhasenko/ims",
+    "repository": "galaxym12development/android_packages_apps_ims",
     "target_path": "packages/apps/Ims",
-    "branch": "main"
+    "branch": "lineage-21"
 }
 ```
 
@@ -195,13 +186,19 @@ appropriately. The mixer path fix alone is sufficient.
 | Feature | Status |
 |---------|--------|
 | Registration | Works (initial and periodic re-REGISTER both succeed) |
-| Incoming SMS | Works |
-| Outgoing SMS | Not tested |
-| Incoming Calls | Fix for "dropped after accept" committed; needs device verification |
+| Incoming Calls | Works |
 | Outgoing Calls | Works with mixer_paths.xml fix |
 | Mic audio during call | Works with mixer_paths.xml fix |
 | Video recording | Works (stock path, unaffected) |
 | Voice Recorder | Works (stock path, unaffected) |
+
+## Tested on
+
+| Device | LineageOS | Carrier |
+|--------|-----------|---------|
+| Galaxy M12 (SM-M127G) | 21 (Android 14) | Jio, India |
+| Galaxy A12 (SM-A127M) | 21 (Android 14) | Vivo, Brazil |
+| Galaxy A21s (SM-A217F) | 23.2 (Android 16) | O2, Germany |
 
 ## Building with Gradle
 
