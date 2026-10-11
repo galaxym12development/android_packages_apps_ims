@@ -158,3 +158,6 @@ fun SipSmsEncodeAck(ref: Byte): ByteArray {
 
     return bufArray
 }
+
+fun SipSmsEncodeError(ref: Byte, cause: Int): ByteArray =
+    byteArrayOf(SmsType.RP_ERROR_TO_NETWORK.value, ref, 1, (cause and 0x7f).toByte())

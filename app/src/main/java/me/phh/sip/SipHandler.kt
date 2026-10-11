@@ -2267,12 +2267,11 @@ P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=4500620f331a5e06
                 }
 
                 val token = smsLock.withLock { smsToken++ }
+                // Answer the SC in P-Asserted-Identity like stock, From is only
+                // a display number when the SMS comes through an A2P gateway
                 val dest =
-                    request.headers["from"]!![0]
-                        .getParams()
-                        .component1()
-                        .trimStart('<')
-                        .trimEnd('>')
+                    (request.headers["p-asserted-identity"]?.getOrNull(0) ?: request.headers["from"]!![0])
+                        .let { h -> Regex("<([^>]*)>").find(h)?.groupValues?.get(1) ?: h.substringBefore(";").trim() }
                 val callId = request.headers["call-id"]!![0]
                 val cseq = request.headers["cseq"]!![0]
                 smsHeadersMap[token] = smsHeaders(dest, callId, cseq, sms.ref)
@@ -2441,8 +2440,9 @@ P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=4500620f331a5e06
         synchronized(socket.gWriter()) { socket.gWriter().write(msg.toByteArray()) }
     }
 
-    fun sendSmsAck(token: Int, ref: Int, error: Boolean): Unit {
-        Rlog.d(TAG, "sending sms ack")
+    // rpCause null sends RP-ACK, otherwise RP-ERROR with that cause
+    fun sendSmsAck(token: Int, ref: Int, rpCause: Int?): Unit {
+        Rlog.d(TAG, "sending sms ack, rpCause $rpCause")
         val headers = smsHeadersMap.remove(token)
         if (headers == null) {
             // XXX return error?
@@ -2450,19 +2450,17 @@ P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=4500620f331a5e06
         }
         // The RP-ACK has to echo the RP message reference of the RP-DATA,
         // the framework only knows the TP one
-        val body = SipSmsEncodeAck(headers.rpRef)
-        // do not send ack on error
-        // Should we send an error report?
-        if (error) {
-            return
-        }
+        val body = if (rpCause == null) SipSmsEncodeAck(headers.rpRef)
+            else SipSmsEncodeError(headers.rpRef, rpCause)
+        // New transaction towards the SC, tied to the RP-DATA by In-Reply-To
         val msg =
             SipRequest(
                 SipMethod.MESSAGE,
                 headers.dest,
                 commonHeaders +
                     """
-                    Cseq: ${headers.cseq}
+                    To: <${headers.dest}>
+                    CSeq: 1 MESSAGE
                     In-Reply-To: ${headers.callId}
                     Content-Type: application/vnd.3gpp.sms
                     Proxy-Require: sec-agree

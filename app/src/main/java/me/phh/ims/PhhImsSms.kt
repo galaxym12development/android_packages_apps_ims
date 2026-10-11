@@ -77,9 +77,13 @@ class PhhImsSms(val slotId: Int) : ImsSmsImplBase() {
         // called when android acks a received sms
         Rlog.d(TAG, "$slotId acknowledgeSms $token, $messageRef, $result")
 
-        // open notification on error?
-        val error = result != ImsSmsImplBase.DELIVER_STATUS_OK
-        sipHandler.sendSmsAck(token, messageRef, error)
+        // TS 24.011 8.2.5.4: 22 memory capacity exceeded, 111 protocol error
+        val rpCause = when (result) {
+            ImsSmsImplBase.DELIVER_STATUS_OK -> null
+            ImsSmsImplBase.DELIVER_STATUS_ERROR_NO_MEMORY -> 22
+            else -> 111
+        }
+        sipHandler.sendSmsAck(token, messageRef, rpCause)
     }
     override fun acknowledgeSmsReport(token: Int, messageRef: Int, result: Int) {
         // called when android acks onSmsStatusReportReceived?
