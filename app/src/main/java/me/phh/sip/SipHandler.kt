@@ -2150,6 +2150,47 @@ P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=4500620f331a5e06
         return 200
     }
 
+    // EF_SMSP (TS 31.102 4.2.27): the SMSC address is the 12 bytes before
+    // the last 3 (PID, DCS and validity period) of the record
+    private fun readSmscFromSim(): String? {
+        val tm = telephonyManager.createForSubscriptionId(subId)
+        // USIM through the current ADF, then a 2G SIM through DF_TELECOM
+        for ((cla, path) in listOf(0x00 to "7FFF6F42", 0xA0 to "7F106F42")) {
+            try {
+                val sel = tm.iccTransmitApduBasicChannel(cla, 0xA4, 0x08, 0x04, 4, path)
+                val sw = sel?.takeLast(4) ?: ""
+                if (sw != "9000" && !sw.startsWith("61")) {
+                    Rlog.d(TAG, "EF_SMSP select failed: $sel")
+                    continue
+                }
+                var rec = tm.iccTransmitApduBasicChannel(cla, 0xB2, 0x01, 0x04, 0, "")
+                if (rec != null && rec.length == 4 && rec.startsWith("6C"))
+                    rec = tm.iccTransmitApduBasicChannel(cla, 0xB2, 0x01, 0x04,
+                        rec.substring(2).toInt(16), "")
+                if (rec == null || !rec.endsWith("9000") || rec.length < 4 + 28 * 2) {
+                    Rlog.d(TAG, "EF_SMSP read failed: $rec")
+                    continue
+                }
+                Rlog.d(TAG, "EF_SMSP record $rec")
+                val data = rec.dropLast(4).chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+                val off = data.size - 15
+                val len = data[off].toInt() and 0xff
+                if (len < 2 || len > 11) {
+                    Rlog.d(TAG, "EF_SMSP has no SMSC")
+                    return null
+                }
+                val number = PhoneNumberUtils.calledPartyBCDToString(data, off + 1, len,
+                    PhoneNumberUtils.BCD_EXTENDED_TYPE_CALLED_PARTY)?.trimStart('+')
+                Rlog.d(TAG, "Got smsc $number from EF_SMSP")
+                if (number != null && number.length >= 5 && number.all { it.isDigit() })
+                    return number
+            } catch (t: Throwable) {
+                Rlog.d(TAG, "EF_SMSP failed", t)
+            }
+        }
+        return null
+    }
+
     fun sendSms(
         smsSmsc: String?,
         pdu: ByteArray,
@@ -2179,7 +2220,7 @@ P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=4500620f331a5e06
                     Rlog.d(TAG, "Got smsc $smscIdentity // host is ${smscIdentity?.host} // ${smscIdentity?.scheme} // ${smscIdentity?.path}")
                     smscIdentity!!.host!!
                 } catch(t: Throwable) {
-                    try {
+                    val fromRil = try {
                         Rlog.d(TAG, "getSmscIdentity failed", t)
                         val smscStr = smsManager.smscAddress
                         val smscMatchRegex = Regex("([0-9]+)")
@@ -2190,6 +2231,9 @@ P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=4500620f331a5e06
                         Rlog.d(TAG, "smscAddress failed", t)
                         null
                     }
+                    // Some Samsung RILs return a garbled SMSC, read it from the SIM then
+                    if (fromRil != null && fromRil.length >= 5) fromRil
+                    else readSmscFromSim() ?: fromRil
                 }
             }
 
