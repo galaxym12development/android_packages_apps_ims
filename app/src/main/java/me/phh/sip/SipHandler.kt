@@ -32,6 +32,7 @@ private data class smsHeaders(
     val dest: String,
     val callId: String,
     val cseq: String,
+    val rpRef: Byte,
 )
 
 class SipHandler(val ctxt: Context) {
@@ -2128,7 +2129,7 @@ P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=4500620f331a5e06
                         .trimEnd('>')
                 val callId = request.headers["call-id"]!![0]
                 val cseq = request.headers["cseq"]!![0]
-                smsHeadersMap[token] = smsHeaders(dest, callId, cseq)
+                smsHeadersMap[token] = smsHeaders(dest, callId, cseq, sms.ref)
                 try {
                     receivedCb(token, "3gpp", sms.pdu!!)
                 } catch(t: Throwable) {
@@ -2285,12 +2286,14 @@ P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=4500620f331a5e06
 
     fun sendSmsAck(token: Int, ref: Int, error: Boolean): Unit {
         Rlog.d(TAG, "sending sms ack")
-        val body = SipSmsEncodeAck(ref.toByte())
         val headers = smsHeadersMap.remove(token)
         if (headers == null) {
             // XXX return error?
             return
         }
+        // The RP-ACK has to echo the RP message reference of the RP-DATA,
+        // the framework only knows the TP one
+        val body = SipSmsEncodeAck(headers.rpRef)
         // do not send ack on error
         // Should we send an error report?
         if (error) {
