@@ -859,7 +859,7 @@ a=curr:qos remote sendrecv
 a=des:qos mandatory local sendrecv
 a=des:qos mandatory remote sendrecv
 a=sendrecv
-                       """.trim().toByteArray()
+                       """.trim().sdpLines()
 
         currentCall = Call(
             outgoing =  call.outgoing,
@@ -1487,7 +1487,7 @@ a=curr:qos remote none
 a=des:qos optional local sendrecv
 a=des:qos optional remote sendrecv
 a=sendrecv
-                       """.trim().toByteArray()
+                       """.trim().sdpLines()
 
             val to = "tel:$phoneNumber;phone-context=ims.mnc$mnc.mcc$mcc.3gppnetwork.org"
             val sipInstance = "<urn:gsma:imei:${imei.substring(0, 8)}-${imei.substring(8, 14)}-0>"
@@ -2026,7 +2026,7 @@ a=des:qos mandatory local sendrecv
 a=des:qos mandatory remote sendrecv
 a=conf:qos remote sendrecv""".trimIndent() else ""}
 a=sendrecv
-                       """.trim()).toByteArray()
+                       """.trim()).sdpLines()
 
             // Generate a single local tag for all responses in this dialog (RFC 3261 §12.1.1)
             val localToTag = randomBytes(6).toHex()
