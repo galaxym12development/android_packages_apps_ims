@@ -111,8 +111,25 @@ class SipHandler(val ctxt: Context) {
         val clientSpiS: IpSecManager.SecurityParameterIndex,
         val serverSpiC: IpSecManager.SecurityParameterIndex? = null,
         val serverSpiS: IpSecManager.SecurityParameterIndex? = null,
+        val serverInTransform: IpSecTransform? = null,
+        val serverOutTransform: IpSecTransform? = null,
     )
     lateinit var ipsecSettings: SipIpsecSettings
+
+    // IpSecService caps the SPIs per app, so the ones from the previous
+    // connection must go before allocating new ones
+    private fun closeIpsecResources() {
+        if (this::socket.isInitialized) runCatching { socket.close() }
+        if (this::plainSocket.isInitialized) runCatching { plainSocket.close() }
+        if (this::serverSocket.isInitialized) runCatching { serverSocket.serverSocket.close() }
+        if (this::serverSocketUdp.isInitialized) runCatching { serverSocketUdp.socket.close() }
+        if (!this::ipsecSettings.isInitialized) return
+        val settings = ipsecSettings
+        listOfNotNull(settings.serverInTransform, settings.serverOutTransform)
+            .forEach { runCatching { it.close() } }
+        listOfNotNull(settings.serverSpiC, settings.serverSpiS, settings.clientSpiC, settings.clientSpiS)
+            .forEach { runCatching { it.close() } }
+    }
 
     lateinit private var network: Network
 
@@ -299,6 +316,7 @@ class SipHandler(val ctxt: Context) {
         myTel = ""
         terminatedIncomingCallIds.clear()
 
+        closeIpsecResources()
         val clientSpiC = ipSecManager.allocateSecurityParameterIndex(localAddr)
         val clientSpiS = ipSecManager.allocateSecurityParameterIndex(localAddr, clientSpiC.spi + 1)
         ipsecSettings = SipIpsecSettings(
@@ -425,6 +443,9 @@ class SipHandler(val ctxt: Context) {
 
             val serverInTransform = ipSecBuilder.buildTransportModeTransform(pcscfAddr, clientSpiS)
             val serverOutTransform = ipSecBuilder.buildTransportModeTransform(localAddr, serverSpiC)
+            ipsecSettings = ipsecSettings.copy(
+                serverInTransform = serverInTransform,
+                serverOutTransform = serverOutTransform)
             socket.enableIpsec(ipSecBuilder, ipSecManager, clientSpiC, serverSpiS)
             serverSocket.enableIpsec(ipSecManager, serverInTransform, serverOutTransform)
             serverSocketUdp.enableIpsec(ipSecManager, serverInTransform, serverOutTransform)

@@ -100,6 +100,8 @@ class SipConnectionTcp(
 
     override fun close() {
         socket.close()
+        if (this::inTransform.isInitialized) runCatching { inTransform.close() }
+        if (this::outTransform.isInitialized) runCatching { outTransform.close() }
     }
 
     override fun enableIpsec(
@@ -271,6 +273,8 @@ class SipConnectionUdp(
 
     override fun close() {
         socket.close()
+        if (this::inTransform.isInitialized) runCatching { inTransform.close() }
+        if (this::outTransform.isInitialized) runCatching { outTransform.close() }
     }
 
     override fun enableIpsec(
