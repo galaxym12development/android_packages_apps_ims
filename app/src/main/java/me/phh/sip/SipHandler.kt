@@ -504,6 +504,7 @@ class SipHandler(val ctxt: Context) {
         setRequestCallback(SipMethod.MESSAGE, ::handleSms)
         setRequestCallback(SipMethod.INVITE, ::handleCall)
         setRequestCallback(SipMethod.PRACK, ::handlePrack)
+        setRequestCallback(SipMethod.ACK, ::handleAck)
         setRequestCallback(SipMethod.CANCEL, ::handleCancel)
         setRequestCallback(SipMethod.BYE, ::handleBye)
         setRequestCallback(SipMethod.UPDATE, ::handleUpdate)
@@ -872,6 +873,13 @@ class SipHandler(val ctxt: Context) {
         val id = request.headers["rack"]!![0].split(" ")[0].toInt()
         prackWaitTracker.ack(id)
         return 200
+    }
+
+    // ACK never gets a response (RFC 3261 17.2.1)
+    fun handleAck(request: SipRequest): Int {
+        val callId = request.headers["call-id"]?.getOrNull(0).orEmpty()
+        Rlog.d(TAG, "Received ACK for call-id=$callId current=${currentCallId()}")
+        return 0
     }
 
     fun handleUpdate(request: SipRequest): Int {
