@@ -70,6 +70,10 @@ class SipHandler(val ctxt: Context) {
         "208010" -> true // 20810 can do TCP and UDP. use this for testing
         else -> false
     }
+    private val isJio = mcc == "405" && mnc.toIntOrNull().let { it == 840 || it in 854..874 }
+    private val isVivoBr = mcc + mnc in listOf("724006", "724010", "724011", "724023", "724089")
+    // Samsung addresses the SMSC with a TEL URI on Jio, a SIP URI elsewhere
+    val smscTelUri = isJio
     val forceSmsc = when(mcc + mnc) {
         "450006" -> "821080010585" // LG U+
         else -> null
@@ -2262,6 +2266,8 @@ P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=4500620f331a5e06
         return 200
     }
 
+    private val simSmsc: String? by lazy { readSmscFromSim() }
+
     // EF_SMSP (TS 31.102 4.2.27): the SMSC address is the 12 bytes before
     // the last 3 (PID, DCS and validity period) of the record
     private fun readSmscFromSim(): String? {
@@ -2320,24 +2326,20 @@ P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=4500620f331a5e06
         } catch (t: Throwable) { null }
         Rlog.d(TAG, "Got smscIdentity $smscIdentity")
 
-        val frameworkSmsc = normalizeSmscNumber(smsSmsc)
-        // make ref up?
+        // Same order as stock: the SCA the framework took from the PDU/SIM,
+        // then EF_SMSP, then the RIL
         val smsc =
-            frameworkSmsc
+            normalizeSmscNumber(smsSmsc)
                 ?: forceSmsc
-                ?: smscIdentity?.host
-                ?: run {
-                    val fromRil = try {
-                        val smscStr = smsManager.smscAddress
-                        val parsed = normalizeSmscNumber(smscStr)
-                        Rlog.d(TAG, "Got smsc $smscStr, parsed $parsed")
-                        parsed
-                    } catch(t: Throwable) {
-                        Rlog.d(TAG, "smscAddress failed", t)
-                        null
-                    }
-                    // Some Samsung RILs return a garbled SMSC, read it from the SIM then
-                    fromRil ?: readSmscFromSim()
+                ?: simSmsc
+                ?: try {
+                    val smscStr = smsManager.smscAddress
+                    val parsed = normalizeSmscNumber(smscStr)
+                    Rlog.d(TAG, "Got smsc $smscStr, parsed $parsed")
+                    parsed
+                } catch(t: Throwable) {
+                    Rlog.d(TAG, "smscAddress failed", t)
+                    null
                 }
 
         // RP-DATA destination address. Passing an empty string makes
@@ -2346,30 +2348,29 @@ P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=4500620f331a5e06
         val rpSmsc = smsc?.let { "+$it" }
         val data = SipSmsEncodeSms(ref.toByte(), rpSmsc, pdu)
         Rlog.d(TAG, "sending sms ${data.toHex()} to smsc $smsc rpSmsc=$rpSmsc")
-        val dest =
-            if(smscIdentity != null)
-                "sip:$smscIdentity"
-            else
-                "sip:+$smsc@$realm"
+        val domain = mySip.substringAfter("@", realm).substringBefore(";").substringBefore(">")
+        val dest = smscIdentity?.toString()?.let { if (it.startsWith("sip:") || it.startsWith("tel:")) it else "sip:$it" }
+            ?: when {
+                smsc == null -> "sip:$domain"
+                smscTelUri -> "tel:+$smsc"
+                else -> "sip:+$smsc@$domain"
+            }
 
-        // "sip:ipsmgw.lte-lguplus.co.kr",
         val msg =
             SipRequest(
                 SipMethod.MESSAGE,
-                "sip:${smscIdentity ?: realm}",
+                dest,
                 commonHeaders +
                     """
                     From: <$mySip>
                     To: <$dest>
                     P-Preferred-Identity: <$mySip>
-                    P-Asserted-Identity: <$mySip>
-                    Expires: 7200
                     Content-Type: application/vnd.3gpp.sms
                     Supported: sec-agree, path
                     Require: sec-agree
                     Proxy-Require: sec-agree
                     Allow: MESSAGE
-                    Accept-Contact: *;+g.3gpp.smsip;require;explicit
+                    Accept-Contact: *;+g.3gpp.smsip
                     Request-Disposition: no-fork
                     """.toSipHeadersMap(),
                 data
