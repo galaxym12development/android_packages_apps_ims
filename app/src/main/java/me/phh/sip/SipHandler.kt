@@ -83,6 +83,60 @@ class SipHandler(val ctxt: Context) {
         else -> MediaSettings(38, 0, 0, "optional")
     }
     private val mediaBandwidth = "b=AS:${media.bwAs}\nb=RS:${media.bwRs}\nb=RR:${media.bwRr}"
+
+    private val amrWbMediaCodecAvailable: Boolean by lazy {
+        isMediaCodecAvailableFor(SipAudioCodecs.AMR_WB)
+    }
+
+    private fun isMediaCodecAvailableFor(audioCodec: NegotiatedAudioCodec): Boolean {
+        var encoder: MediaCodec? = null
+        var decoder: MediaCodec? = null
+        return try {
+            encoder = MediaCodec.createEncoderByType(audioCodec.mimeType)
+            decoder = MediaCodec.createDecoderByType(audioCodec.mimeType)
+            Rlog.d(TAG, "MediaCodec available for ${audioCodec.name}: mime=${audioCodec.mimeType}")
+            true
+        } catch (t: Throwable) {
+            Rlog.w(TAG, "MediaCodec unavailable for ${audioCodec.name}: mime=${audioCodec.mimeType}", t)
+            false
+        } finally {
+            try { encoder?.release() } catch (_: Throwable) { }
+            try { decoder?.release() } catch (_: Throwable) { }
+        }
+    }
+
+    private fun speechCodecRtpmapName(audioCodec: NegotiatedAudioCodec): String =
+        "${audioCodec.sdpCodecName}/${audioCodec.rtpClockRate}"
+
+    private fun telephoneEventRtpmapName(audioCodec: NegotiatedAudioCodec): String =
+        "telephone-event/${audioCodec.rtpClockRate}"
+
+    private fun defaultSpeechFmtpAnswer(track: Int, audioCodec: NegotiatedAudioCodec): String =
+        if (audioCodec == SipAudioCodecs.AMR_WB) {
+            "fmtp:$track octet-align=0;mode-change-capability=2;max-red=0"
+        } else {
+            "fmtp:$track mode-set=7;octet-align=0;max-red=0"
+        }
+
+    // Pick AMR-WB when the remote SDP has a bandwidth-efficient AMR-WB/16000
+    // payload plus telephone-event/16000 and this device has an AMR-WB codec.
+    private fun selectSpeechCodec(sdp: List<String>, context: String): NegotiatedAudioCodec {
+        SipAudioCodecSdpLogger.logRemoteAudioCodecCandidates(TAG, context, sdp)
+        val candidates = SipAudioCodecSdpLogger.parseRemoteAudioCodecCandidates(sdp)
+        val amrWbCandidate = candidates.firstOrNull {
+            it.codec == SipAudioCodecs.AMR_WB.sdpCodecName &&
+                it.rate == SipAudioCodecs.AMR_WB.rtpClockRate &&
+                !it.fmtp.contains("octet-align=1", ignoreCase = true)
+        }
+        val hasAmrWbTelephoneEvent = candidates.any {
+            it.codec == "TELEPHONE-EVENT" && it.rate == SipAudioCodecs.AMR_WB.rtpClockRate
+        }
+        val useAmrWb = amrWbCandidate != null && hasAmrWbTelephoneEvent && amrWbMediaCodecAvailable
+        Rlog.d(TAG, "$context selected ${if (useAmrWb) "AMR-WB/16000" else "AMR-NB/8000"} " +
+            "amrWbCandidate=${amrWbCandidate?.let { SipAudioCodecSdpLogger.describeRemoteAudioCodecCandidate(it) }} " +
+            "hasTelephoneEvent16000=$hasAmrWbTelephoneEvent mediaCodecAvailable=$amrWbMediaCodecAvailable")
+        return if (useAmrWb) SipAudioCodecs.AMR_WB else SipAudioCodecs.AMR_NB
+    }
     val forceSmsc = when(mcc + mnc) {
         "450006" -> "821080010585" // LG U+
         else -> null
@@ -991,12 +1045,12 @@ c=IN $ipType ${socket.gLocalAddr().hostAddress}
 t=0 0
 m=audio ${call.rtpSocket.localPort} RTP/AVP ${allTracks.joinToString(" ")}
 $mediaBandwidth
-a=rtpmap:${call.amrTrack} AMR/8000/1
-a=rtpmap:${call.dtmfTrack} telephone-event/8000
-a=${call.amrTrackDesc}
+a=rtpmap:${call.amrTrack} ${speechCodecRtpmapName(call.audioCodec)}/1
+a=rtpmap:${call.dtmfTrack} ${telephoneEventRtpmapName(call.audioCodec)}
+a=${call.amrFmtp}
 a=ptime:20
 a=maxptime:240
-a=${call.dtmfTrackDesc}
+a=fmtp:${call.dtmfTrack} 0-15
 a=curr:qos local sendrecv
 a=curr:qos remote sendrecv
 a=des:qos mandatory local sendrecv
@@ -1006,6 +1060,8 @@ a=sendrecv
 
         currentCall = Call(
             outgoing =  call.outgoing,
+            audioCodec = call.audioCodec,
+            amrFmtp = call.amrFmtp,
             amrTrack = call.amrTrack,
             amrTrackDesc = call.amrTrackDesc,
             dtmfTrack = call.dtmfTrack,
@@ -1102,6 +1158,9 @@ a=sendrecv
         val outgoing: Boolean,
         val callHeaders: SipHeadersMap,
         val sdp: ByteArray,
+        val audioCodec: NegotiatedAudioCodec,
+        // Our a=fmtp line for the speech payload, without the "a="
+        val amrFmtp: String,
         val amrTrack: Int,
         val amrTrackDesc: String,
         val dtmfTrack: Int,
@@ -1122,10 +1181,11 @@ a=sendrecv
         thread {
             var sequenceNumber = 0
 
-            Rlog.d(TAG, "Encode thread started: amrTrack=${call.amrTrack} remote=${call.rtpRemoteAddr}:${call.rtpRemotePort} gen=$gen")
-            val encoder = MediaCodec.createEncoderByType("audio/3gpp")
-            val mediaFormat = MediaFormat.createAudioFormat("audio/3gpp", 8000, 1)
-            mediaFormat.setInteger(MediaFormat.KEY_BIT_RATE, 12200)
+            val audioCodec = call.audioCodec
+            Rlog.d(TAG, "Encode thread started: codec=${audioCodec.name}/${audioCodec.sampleRate} amrTrack=${call.amrTrack} remote=${call.rtpRemoteAddr}:${call.rtpRemotePort} gen=$gen")
+            val encoder = MediaCodec.createEncoderByType(audioCodec.mimeType)
+            val mediaFormat = MediaFormat.createAudioFormat(audioCodec.mimeType, audioCodec.sampleRate, audioCodec.channelCount)
+            mediaFormat.setInteger(MediaFormat.KEY_BIT_RATE, audioCodec.bitRate)
             mediaFormat.setInteger(MediaFormat.KEY_PRIORITY, 0) //  0 = realtime priority, encoder will not fall behind
             encoder.configure(mediaFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             encoder.start()
@@ -1137,19 +1197,9 @@ a=sendrecv
                     encoder.release()
                     return@thread
                 }
-                val timestamp = sequenceNumber * 160
+                val timestamp = sequenceNumber * audioCodec.rtpTimestampStep
                 Thread.sleep(20)
-                val rtpHeader = listOf(
-                    // RTP
-                    0x80, //rtp version
-                    call.amrTrack, //payload type
-                    (sequenceNumber shr 8), (sequenceNumber and 0xff),
-                    (timestamp shr 24), ((timestamp shr 16) and 0xff), ((timestamp shr 8) and 0xff), (timestamp and 0xff),
-                    0x03, 0x00, 0xd2, 0x00, //SSRC
-                )
-                val amrNothing = listOf(0x77, 0xc0) // CMR = 12.2kbps, F=0, FT=15=No TX/No RX, Q=1
-
-                val buf = (rtpHeader + amrNothing).map { it.toUByte() }.toUByteArray().toByteArray()
+                val buf = SipAmrRtpPayload.buildNoDataRtpPacket(audioCodec, call.amrTrack, sequenceNumber, timestamp)
 
                 val dgramPacket =
                     DatagramPacket(buf, buf.size, call.rtpRemoteAddr, call.rtpRemotePort)
@@ -1160,8 +1210,8 @@ a=sendrecv
 
             // DANGER: Don't open the mic before the user acknowledged opening the call!
 
-            val minBufferSize = AudioRecord.getMinBufferSize(8000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-            val audioRecord = AudioRecord(MediaRecorder.AudioSource.MIC, 8000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, minBufferSize)
+            val minBufferSize = AudioRecord.getMinBufferSize(audioCodec.sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+            val audioRecord = AudioRecord(MediaRecorder.AudioSource.MIC, audioCodec.sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, minBufferSize)
             Rlog.d(TAG, "AudioRecord created with minBufferSize=$minBufferSize, state=${audioRecord.state}")
 
             // Pin capture to the built-in mic so the Samsung HAL cannot reroute it to
@@ -1234,47 +1284,27 @@ a=sendrecv
 
                     var bufPos = 0
                     while (bufPos < outBufInfo.size) {
-                        val frameSize = 32
+                        // Encoder outputs AMR storage-format frames (RFC 4867 §5):
+                        //   byte 0 = frame header: [0][FT[3:0]][Q][PP], then the speech bits
+                        val ft = (encoderData[bufPos].toUByte().toInt() shr 3) and 0xf
+                        val frameSize = SipAmrRtpPayload.storageFrameSizeBytes(audioCodec, ft)
+                        if (frameSize == null) {
+                            Rlog.w(TAG, "Skipping encoder output with unsupported FT=$ft codec=${audioCodec.name}")
+                            break
+                        }
                         if (outBufInfo.size - bufPos < frameSize) break
 
-                        // Encoder outputs octet-aligned AMR-NB frames (RFC 4867 §5):
-                        //   byte 0 = frame header: [0][FT[3:0]][Q][PP]
-                        //   bytes 1-31 = 244 payload bits, MSB-first, 4 bits zero-padding at end
-                        val ft = (encoderData[bufPos].toUByte().toInt() shr 3) and 0xf
-                        val q  = (encoderData[bufPos].toUByte().toInt() shr 2) and 0x1
-
-                        // Build RFC 4867 §4.4 bandwidth-efficient single-frame payload (32 bytes):
-                        //   [CMR(4)][F(1)][FT(4)][Q(1)][payload_bits(244)][pad(2)]
-                        // CMR=15 (0xF) = no codec-mode request; F=0 = last (only) frame.
-                        val cmr = 0xf
-                        val f   = 0
-                        // Byte 0: CMR[3:0] | F | FT[3:1]
-                        val beByte0 = (cmr shl 4) or (f shl 3) or (ft shr 1)
-                        // Byte 1: FT[0] | Q | payload[0:5]  (upper 6 bits of encoder byte 1)
-                        val beByte1 = ((ft and 1) shl 7) or (q shl 6) or
-                                      (encoderData[bufPos + 1].toUByte().toInt() shr 2)
-                        // Bytes 2-31: slide a 2-bit window across encoder bytes 1-31
-                        val beRest = (1 until frameSize - 1).map { i ->
-                            val lo = (encoderData[bufPos + i].toUByte().toInt() and 0x3) shl 6
-                            val hi = (encoderData[bufPos + i + 1].toUByte().toInt() shr 2) and 0x3f
-                            lo or hi
-                        }
-
-                        // Every 20 ms, at 8 kHz, we have 160 samples
-                        val timestamp = sequenceNumber * 160
-                        val rtpHeader = byteArrayOf(
-                            0x80.toByte(),
-                            ((if (firstPacket) 0x80 else 0) or call.amrTrack).toByte(),
-                            (sequenceNumber shr 8).toByte(), (sequenceNumber and 0xff).toByte(),
-                            (timestamp shr 24).toByte(), ((timestamp shr 16) and 0xff).toByte(),
-                            ((timestamp shr 8) and 0xff).toByte(), (timestamp and 0xff).toByte(),
-                            0x03, 0x00, 0xd2.toByte(), 0x00
-                        )
+                        // 20 ms per frame: 160 samples at 8 kHz, 320 at 16 kHz
+                        val timestamp = sequenceNumber * audioCodec.rtpTimestampStep
+                        val buf = SipAmrRtpPayload.buildBandwidthEfficientRtpPacketFromStorageFrame(
+                            audioCodec = audioCodec,
+                            payloadType = call.amrTrack,
+                            sequenceNumber = sequenceNumber,
+                            timestamp = timestamp,
+                            storageFrame = encoderData.copyOfRange(bufPos, bufPos + frameSize),
+                            marker = firstPacket,
+                        ) ?: break
                         firstPacket = false
-
-                        val buf = rtpHeader +
-                            byteArrayOf(beByte0.toByte(), beByte1.toByte()) +
-                            beRest.map { it.toByte() }.toByteArray()
 
                         val dgramPacket = DatagramPacket(buf, buf.size, call.rtpRemoteAddr, call.rtpRemotePort)
                         try {
@@ -1598,11 +1628,19 @@ a=sendrecv
             //rtpSocket.connect(rtpRemoteAddr, rtpRemotePort.toInt())
             Rlog.d(TAG, "RTP socket created for outgoing call: local=${rtpSocket.localAddress}:${rtpSocket.localPort}")
 
-            val amrTrack = 97
-            val amrTrackDesc = "fmtp:97 mode-change-capability=2;octet-align=0;max-red=0"
-            val dtmfTrack = 100
-            val dtmfTrackDesc = "fmtp:100 0-15"
-            val allTracks = listOf(amrTrack,dtmfTrack).sorted()
+            val amrNbTrack = 97
+            val amrWbTrack = 98
+            val dtmfNbTrack = 100
+            val dtmfWbTrack = 101
+            val amrNbFmtp = "fmtp:$amrNbTrack mode-change-capability=2;octet-align=0;max-red=0"
+            val amrWbFmtp = "fmtp:$amrWbTrack octet-align=0;mode-change-capability=2;max-red=0"
+            val offerAmrWb = amrWbMediaCodecAvailable
+            val allTracks = if (offerAmrWb) {
+                listOf(amrWbTrack, amrNbTrack, dtmfWbTrack, dtmfNbTrack)
+            } else {
+                listOf(amrNbTrack, dtmfNbTrack)
+            }
+            Rlog.d(TAG, "Outgoing INVITE codec offer: offerAmrWb=$offerAmrWb tracks=$allTracks")
 
             val ipType = if(localAddr is Inet6Address) "IP6" else "IP4"
 
@@ -1616,10 +1654,16 @@ m=audio ${rtpSocket.localPort} RTP/AVP ${allTracks.joinToString(" ")}
 $mediaBandwidth
 a=ptime:20
 a=maxptime:240
-a=rtpmap:$amrTrack AMR/8000/1
-a=rtpmap:$dtmfTrack telephone-event/8000
-a=fmtp:$amrTrack mode-change-capability=2;octet-align=0;max-red=0
-a=fmtp:$dtmfTrack 0-15
+${if (offerAmrWb) """
+a=rtpmap:$amrWbTrack AMR-WB/16000/1
+a=$amrWbFmtp""".trimIndent() else ""}
+a=rtpmap:$amrNbTrack AMR/8000/1
+a=$amrNbFmtp
+${if (offerAmrWb) """
+a=rtpmap:$dtmfWbTrack telephone-event/16000
+a=fmtp:$dtmfWbTrack 0-15""".trimIndent() else ""}
+a=rtpmap:$dtmfNbTrack telephone-event/8000
+a=fmtp:$dtmfNbTrack 0-15
 ${if (media.precondition != null) """
 a=curr:qos local none
 a=curr:qos remote none
@@ -1799,14 +1843,32 @@ a=sendrecv
                     val v = respSdp.firstOrNull { it.startsWith("$command=")} ?: return null
                     return v.substring(2)
                 }
+                // The answer keeps our payload numbers (RFC 3264 6.1), so map the
+                // selected codec back to them and take the remote fmtp for that payload
+                val answeredPayloads = sdpElement("m")?.trim()?.split("\\s+".toRegex())
+                    ?.drop(3)?.mapNotNull { it.toIntOrNull() }?.toSet().orEmpty()
+                val respAttributes = respSdp.filter { it.startsWith("a=") }.map { it.substring(2) }
+                val answeredCodec = selectSpeechCodec(respSdp,
+                    "outgoing SDP response ${resp.statusCode} callId=${resp.headers["call-id"]?.getOrNull(0)}")
+                val useAmrWb = offerAmrWb && answeredCodec == SipAudioCodecs.AMR_WB &&
+                    amrWbTrack in answeredPayloads && dtmfWbTrack in answeredPayloads
+                val dialogCodec = if (useAmrWb) SipAudioCodecs.AMR_WB else SipAudioCodecs.AMR_NB
+                val amrTrack = if (useAmrWb) amrWbTrack else amrNbTrack
+                val dtmfTrack = if (useAmrWb) dtmfWbTrack else dtmfNbTrack
+                val amrFmtp = respAttributes.firstOrNull { it.startsWith("fmtp:$amrTrack ") }
+                    ?: if (useAmrWb) amrWbFmtp else amrNbFmtp
+                Rlog.d(TAG, "Outgoing dialog codec=${dialogCodec.name} amrTrack=$amrTrack dtmfTrack=$dtmfTrack answered=$answeredPayloads fmtp=$amrFmtp")
+
                 val rtpRemotePort = sdpElement("m")!!.split(" ")[1]
                 val rtpRemoteAddr = InetAddress.getByName(sdpElement("c")!!.split(" ")[2])
                 currentCall = Call(
                     outgoing = true,
+                    audioCodec = dialogCodec,
+                    amrFmtp = amrFmtp,
                     amrTrack = amrTrack,
-                    amrTrackDesc = amrTrackDesc,
+                    amrTrackDesc = "rtpmap:$amrTrack ${speechCodecRtpmapName(dialogCodec)}/1",
                     dtmfTrack = dtmfTrack,
-                    dtmfTrackDesc = dtmfTrackDesc,
+                    dtmfTrackDesc = "rtpmap:$dtmfTrack ${telephoneEventRtpmapName(dialogCodec)}",
                     // Update from/to/call-id based on the response we got to include the remote tag
                     callHeaders = myHeaders - "require" - "content-type" + ("from" to resp.headers["from"]!!) + ("to" to resp.headers["to"]!!) + ("call-id" to resp.headers["call-id"]!!),
                     rtpRemoteAddr = rtpRemoteAddr,
@@ -1897,15 +1959,17 @@ a=sendrecv
     }
 
     fun callDecodeThread() {
+        val audioCodec = currentCall?.audioCodec ?: SipAudioCodecs.AMR_NB
         val gen = callGeneration.get()
         // Receiving thread
         thread {
-            val minBufferSize = AudioTrack.getMinBufferSize(8000, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
-            val audioTrack = AudioTrack(AudioManager.STREAM_VOICE_CALL, 8000, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT, minBufferSize, AudioTrack.MODE_STREAM)
+            Rlog.d(TAG, "Decode thread started: codec=${audioCodec.name}/${audioCodec.sampleRate} gen=$gen")
+            val minBufferSize = AudioTrack.getMinBufferSize(audioCodec.sampleRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
+            val audioTrack = AudioTrack(AudioManager.STREAM_VOICE_CALL, audioCodec.sampleRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT, minBufferSize, AudioTrack.MODE_STREAM)
             audioTrack.play()
 
-            val decoder = MediaCodec.createDecoderByType("audio/3gpp")
-            val mediaFormat = MediaFormat.createAudioFormat("audio/3gpp", 8000, 1)
+            val decoder = MediaCodec.createDecoderByType(audioCodec.mimeType)
+            val mediaFormat = MediaFormat.createAudioFormat(audioCodec.mimeType, audioCodec.sampleRate, audioCodec.channelCount)
             decoder.configure(mediaFormat, null, null, 0)
             decoder.start()
 
@@ -1917,48 +1981,31 @@ a=sendrecv
                 currentCall!!.rtpSocket.receive(dgram)
                 receivedCount++
 
-                // Check RTP payload type
                 val pt = dgramBuf[1].toUByte().toInt() and 0x7f
-                val ft = (dgramBuf[13].toUByte().toUInt() shr 7) or ((dgramBuf[12].toUByte().toUInt() and (7).toUInt()) shl 1)
+                // Bandwidth-efficient payload -> storage frame (header byte + speech bits).
+                // Packets of another payload type (telephone-event) and No Data frames don't parse.
+                val frame = if (pt == currentCall?.amrTrack)
+                    SipAmrRtpPayload.storageFrameFromBandwidthEfficientRtp(audioCodec, dgramBuf, dgram.length)
+                else null
 
                 if (receivedCount % 50 == 0) {
-                    Rlog.d(TAG, "Received RTP packet #$receivedCount: length=${dgram.length} pt=$pt ft=$ft")
+                    Rlog.d(TAG, "Received RTP packet #$receivedCount: length=${dgram.length} pt=$pt ft=${frame?.ft}")
                 }
 
-                if(ft.toInt() != 7) continue
-
-                // RTP header 12 byte
-                // AMR in RTP header 10 bits
-                // Packet size 32, FT=7
-                val baOs = ByteArrayOutputStream()
-
-                baOs.write( ft.toInt() shl 3)
-
-                var m = 0
-                // Warning: we should take good care counting the **bits** of the packet based on FT
-                for(i in 13 until dgram.length ) {
-                    // Take 6 bits left, 2 bits right
-                    val left = (dgramBuf[i].toUByte().toUInt().toInt() and 0x3f)  shl 2
-                    val right = (dgramBuf[i + 1 ].toUByte().toUInt().toInt() shr 6) and 0x3
-                    m++
-                    baOs.write(left or right)
-                }
-                //Rlog.d(TAG, "Received RTP data of length ${dgram.length} $m")
+                if (frame == null) continue
 
                 val inBufIndex = decoder.dequeueInputBuffer(-1)
-                //Rlog.d(TAG, "Got decoding input buffer $inBufIndex")
                 val inBuf = decoder.getInputBuffer(inBufIndex)!!
-                val data = baOs.toByteArray()
+                val data = frame.codecFrame
                 inBuf.clear()
                 inBuf.put(data)
                 decoder.queueInputBuffer(inBufIndex, 0, data.size, 0, 0)
 
                 //TODO: Support DTX (comfort noise frames that don't repeat)
-                //TODO: Can we receive multiple outs per in?
                 val outBufInfo = MediaCodec.BufferInfo()
-                val outBufIndex = decoder.dequeueOutputBuffer(outBufInfo, 0)
-                //Rlog.d(TAG, "Got decoding output buffer $outBufIndex")
-                if (outBufIndex >= 0) {
+                while (true) {
+                    val outBufIndex = decoder.dequeueOutputBuffer(outBufInfo, 0)
+                    if (outBufIndex < 0) break
                     val outBuf = decoder.getOutputBuffer(outBufIndex)!!
                     audioTrack.write(outBuf, outBufInfo.size, AudioTrack.WRITE_BLOCKING)
                     decoder.releaseOutputBuffer(outBufIndex, false)
@@ -2079,7 +2126,7 @@ a=sendrecv
             Rlog.d(TAG, "Matching $codec, got $matches")
             val matches2 = if(matches.size > 1) {
                 matches.sortedBy { m ->
-                    val fmtp = attributes.filter { it.startsWith("fmtp:${m.first}") }[0]
+                    val fmtp = attributes.firstOrNull { it.startsWith("fmtp:${m.first} ") }.orEmpty()
                     Rlog.d(TAG, "Matching $codec, for match $m got fmtp $fmtp")
                     if(fmtp.contains(additional))
                         0
@@ -2096,7 +2143,7 @@ a=sendrecv
         }
 
         fun trackRequirements(track: Int): String? {
-            return attributes.firstOrNull() { it.startsWith("fmtp:$track") }
+            return attributes.firstOrNull() { it.startsWith("fmtp:$track ") }
         }
 
         val hasEarlyMedia = request.headers["p-early-media"]?.isNotEmpty() == true
@@ -2117,13 +2164,20 @@ a=sendrecv
         val useReliableProvisional = hasEarlyMedia ||
             (callerSupports100Rel && callerSupportsPrecondition && incomingOfferHasPrecondition && incomingOfferIsInactive)
 
-        // Look for an AMR/8000 mode
-        // TODO: Select which one? SFR has two, one with mode-set=7 one without it. This would require reading the fmtp lines
-        val (amrTrack, amrTrackDesc) = lookTrackMatching("AMR/8000", "octet-align=0", "octet-align=1")!!
-        val amrTrackRequirements = trackRequirements(amrTrack)
+        val audioCodec = selectSpeechCodec(sdp, "incoming INVITE callId=${request.headers["call-id"]?.getOrNull(0)}")
 
-        // Look for a DTMF track, use the 8000Hz-based one to match AMR timestamps
-        val (dtmfTrack, dtmfTrackDesc) = lookTrackMatching("telephone-event/8000")!!
+        // Look for a bandwidth-efficient mode of the selected codec
+        // TODO: Select which one? SFR has two, one with mode-set=7 one without it. This would require reading the fmtp lines
+        val (amrTrack, amrTrackDesc) = lookTrackMatching(speechCodecRtpmapName(audioCodec), "octet-align=0", "octet-align=1")!!
+        // AMR-WB answers echo the offered fmtp (mode-set and friends)
+        val amrFmtp = if (audioCodec == SipAudioCodecs.AMR_WB) {
+            trackRequirements(amrTrack) ?: defaultSpeechFmtpAnswer(amrTrack, audioCodec)
+        } else {
+            defaultSpeechFmtpAnswer(amrTrack, audioCodec)
+        }
+
+        // Look for a DTMF track with the same clock rate as the speech codec
+        val (dtmfTrack, dtmfTrackDesc) = lookTrackMatching(telephoneEventRtpmapName(audioCodec))!!
 
         val allTracks = listOf(amrTrack, dtmfTrack).sorted()
         // destination is sip:<owner>@realm, extract owner
@@ -2159,7 +2213,7 @@ a=$amrTrackDesc
 a=ptime:20
 a=maxptime:240
 a=$dtmfTrackDesc
-a=fmtp:$amrTrack mode-set=7;octet-align=0;max-red=0
+a=$amrFmtp
 a=fmtp:$dtmfTrack 0-15
 ${if (callerSupportsPrecondition) """
 a=curr:qos local none
@@ -2191,6 +2245,8 @@ a=sendrecv
 
             currentCall = Call(
                 outgoing = false,
+                audioCodec = audioCodec,
+                amrFmtp = amrFmtp,
                 amrTrack = amrTrack,
                 amrTrackDesc = amrTrackDesc,
                 dtmfTrack = dtmfTrack,
