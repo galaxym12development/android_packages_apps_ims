@@ -118,6 +118,20 @@ class SipHandler(val ctxt: Context) {
             "fmtp:$track mode-set=7;octet-align=0;max-red=0"
         }
 
+    // Encoder bit rate allowed by the fmtp mode-set: 12.2 (AMR-NB) or 12.65
+    // (AMR-WB) when allowed or unrestricted, else the highest allowed mode
+    private fun amrBitRate(audioCodec: NegotiatedAudioCodec, fmtp: String): Int {
+        val rates = if (audioCodec == SipAudioCodecs.AMR_WB)
+            intArrayOf(6600, 8850, 12650, 14250, 15850, 18250, 19850, 23050, 23850)
+        else
+            intArrayOf(4750, 5150, 5900, 6700, 7400, 7950, 10200, 12200)
+        val modes = Regex("mode-set=([0-9, ]+)").find(fmtp)?.groupValues?.get(1)
+            ?.split(",")?.mapNotNull { it.trim().toIntOrNull() }?.filter { it in rates.indices }.orEmpty()
+        val preferred = rates.indexOf(audioCodec.bitRate)
+        val mode = if (modes.isEmpty() || preferred in modes) preferred else modes.max()
+        return rates[mode]
+    }
+
     // Pick AMR-WB when the remote SDP has a bandwidth-efficient AMR-WB/16000
     // payload plus telephone-event/16000 and this device has an AMR-WB codec.
     private fun selectSpeechCodec(sdp: List<String>, context: String): NegotiatedAudioCodec {
@@ -1185,7 +1199,9 @@ a=sendrecv
             Rlog.d(TAG, "Encode thread started: codec=${audioCodec.name}/${audioCodec.sampleRate} amrTrack=${call.amrTrack} remote=${call.rtpRemoteAddr}:${call.rtpRemotePort} gen=$gen")
             val encoder = MediaCodec.createEncoderByType(audioCodec.mimeType)
             val mediaFormat = MediaFormat.createAudioFormat(audioCodec.mimeType, audioCodec.sampleRate, audioCodec.channelCount)
-            mediaFormat.setInteger(MediaFormat.KEY_BIT_RATE, audioCodec.bitRate)
+            val bitRate = amrBitRate(audioCodec, call.amrFmtp)
+            Rlog.d(TAG, "Encoder bit rate $bitRate for fmtp ${call.amrFmtp}")
+            mediaFormat.setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
             mediaFormat.setInteger(MediaFormat.KEY_PRIORITY, 0) //  0 = realtime priority, encoder will not fall behind
             encoder.configure(mediaFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             encoder.start()
