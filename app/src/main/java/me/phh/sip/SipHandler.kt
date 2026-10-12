@@ -75,10 +75,11 @@ class SipHandler(val ctxt: Context) {
     // Samsung addresses the SMSC with a TEL URI on Jio, a SIP URI elsewhere
     val smscTelUri = carrier?.smscTel ?: false
     // Voice media settings from the stock imsprofile.json: audio_as/audio_rs/
-    // audio_rr, and the local qos strength we offer when use_precondition is set
+    // audio_rr, and whether to offer preconditions when use_precondition is set.
+    // The local qos stays optional: Vivo BR rejects a mandatory one with 580.
     private data class MediaSettings(val bwAs: Int, val bwRs: Int, val bwRr: Int, val precondition: String?)
     private val media = carrier?.let {
-        MediaSettings(it.bwAs, it.bwRs, it.bwRr, if (it.precondition) "mandatory" else null)
+        MediaSettings(it.bwAs, it.bwRs, it.bwRr, if (it.precondition) "optional" else null)
     } ?: MediaSettings(38, 0, 0, "optional")
     private val mediaBandwidth = "b=AS:${media.bwAs}\nb=RS:${media.bwRs}\nb=RR:${media.bwRr}"
 
@@ -1712,7 +1713,7 @@ a=sendrecv
                     P-Preferred-Identity: <$mySip>
                     P-Asserted-Identity: <$mySip>
                     Expires: 7200
-                    Require: sec-agree${if (media.precondition == "mandatory") ", precondition" else ""}
+                    Require: sec-agree
                     Proxy-Require: sec-agree
                     Allow: INVITE, ACK, CANCEL, BYE, UPDATE, REFER, NOTIFY, MESSAGE, PRACK, OPTIONS
                     P-Early-Media: supported
